@@ -12,6 +12,7 @@ class BinSpec:
     edges: np.ndarray | None = None      # numerical: (K-1,) sorted cut-points
     cat_map: np.ndarray | None = None    # categorical: (n_unique,) → bin_id in [0, K-1]
     n_unique: int = 0
+    K: int = 0                           # per-feature bin count (0 = use spec default)
 
 
 @dataclass
@@ -29,6 +30,8 @@ def build_col_stats(
     feature_types: list[str],
     quantile_sample: int = 10_000,
     quantile_cuts: bool = False,
+    cut_strategy: str = "uniform",
+    kde_params: dict | None = None,
     rng: np.random.Generator | None = None,
 ) -> list[dict]:
     """Compute per-column statistics needed to generate random cut-points."""
@@ -42,12 +45,16 @@ def build_col_stats(
             finite = col[np.isfinite(col)]
             lo = float(finite.min()) if len(finite) else 0.0
             hi = float(finite.max()) if len(finite) else 1.0
-            if quantile_cuts and len(finite) > 1:
+            n_unique = len(np.unique(finite)) if len(finite) else 0
+            q25 = float(np.percentile(finite, 25)) if len(finite) else 0.0
+            q75 = float(np.percentile(finite, 75)) if len(finite) else 0.0
+            std = float(np.std(finite)) if len(finite) else 0.0
+            if (quantile_cuts or cut_strategy == "quantile") and len(finite) > 1:
                 k = min(quantile_sample, len(finite))
                 qpts = np.sort(rng.choice(finite, size=k, replace=False))
-                stats.append({"type": "numerical", "quantile_pts": qpts, "min": lo, "max": hi})
+                stats.append({"type": "numerical", "quantile_pts": qpts, "min": lo, "max": hi, "n_unique": n_unique, "q25": q25, "q75": q75, "std": std})
             else:
-                stats.append({"type": "numerical", "min": lo, "max": hi})
+                stats.append({"type": "numerical", "min": lo, "max": hi, "n_unique": n_unique, "q25": q25, "q75": q75, "std": std})
         else:
             # categoricals are label-encoded ints in [0, n_unique-1]; -1 = unknown
             valid = col[col >= 0].astype(np.int32)
@@ -63,6 +70,12 @@ def build_iteration_specs(
     n_bins: int,
     feature_weights: np.ndarray,
     rng: np.random.Generator,
+    cut_strategy: str = "uniform",
+    kde_params: dict | None = None,
+    X: np.ndarray | None = None,
+    adaptive_bins_map: dict[int, int] | None = None,
+    correlation_groups: list[list[int]] | None = None,
+    correlation_aware: bool = False,
 ) -> list[IterationSpec]:
     d = len(col_stats)
     probs = feature_weights / feature_weights.sum()
@@ -70,34 +83,63 @@ def build_iteration_specs(
     specs = []
 
     for _ in range(n_iterations):
-        feat_idx = _weighted_choice_no_replace(probs, n_sel, rng)
+        # Feature selection: correlation-aware or standard
+        if correlation_aware and correlation_groups is not None:
+            from .correlation_aware import select_features_correlation_aware
+            feat_idx = np.array(
+                select_features_correlation_aware(
+                    correlation_groups, feature_weights, n_sel, rng
+                ),
+                dtype=np.int64,
+            )
+        else:
+            feat_idx = _weighted_choice_no_replace(probs, n_sel, rng)
+
         bin_specs = []
+        max_K = 0
         for ci in feat_idx:
             s = col_stats[ci]
+            # Per-feature bin count from adaptive map, or default
+            K_eff = adaptive_bins_map.get(ci, n_bins) if adaptive_bins_map else n_bins
+            max_K = max(max_K, K_eff)
+
             if s["type"] == "numerical":
-                edges = _make_num_edges(s, n_bins, rng)
-                bin_specs.append(BinSpec(col_idx=ci, type="numerical", edges=edges))
-            else:
-                cat_map = _make_cat_map(s["n_unique"], n_bins, rng)
-                bin_specs.append(
-                    BinSpec(col_idx=ci, type="categorical", cat_map=cat_map, n_unique=s["n_unique"])
+                col_data = X[:, ci] if X is not None and cut_strategy == "kde_peaks" else None
+                edges = _make_num_edges(
+                    s, K_eff, rng, cut_strategy=cut_strategy, kde_params=kde_params, col_data=col_data
                 )
-        specs.append(IterationSpec(bin_specs=bin_specs, K=n_bins))
+                bin_specs.append(BinSpec(col_idx=ci, type="numerical", edges=edges, K=K_eff))
+            else:
+                cat_map = _make_cat_map(s["n_unique"], K_eff, rng)
+                bin_specs.append(
+                    BinSpec(
+                        col_idx=ci, type="categorical", cat_map=cat_map, n_unique=s["n_unique"], K=K_eff
+                    )
+                )
+        specs.append(IterationSpec(bin_specs=bin_specs, K=max_K if adaptive_bins_map else n_bins))
 
     return specs
 
 
 def _weighted_choice_no_replace(probs: np.ndarray, size: int, rng: np.random.Generator) -> np.ndarray:
     """Weighted sampling without replacement via Gumbel-max trick."""
+    if size <= 0:
+        return np.array([], dtype=np.int64)
     log_p = np.log(np.clip(probs, 1e-300, None))
     keys = log_p + rng.gumbel(size=len(probs))
     return np.argpartition(keys, -size)[-size:]
 
 
-def _make_num_edges(s: dict, K: int, rng: np.random.Generator) -> np.ndarray:
-    n_edges = K - 1
+def _make_num_edges(s: dict, K: int, rng: np.random.Generator, cut_strategy: str = "uniform", kde_params: dict | None = None, col_data: np.ndarray | None = None) -> np.ndarray:
+    # Guard: K=0 is invalid — treat as K=1 (no edges needed, everything → single bin)
+    K_eff = max(K, 1)
+    n_edges = K_eff - 1
     if n_edges == 0:
         return np.array([], dtype=np.float64)
+    if cut_strategy == "kde_peaks" and col_data is not None:
+        from .kde_cuts import kde_peaks_cut_points
+        cuts, _ = kde_peaks_cut_points(col_data, n_edges, rng, kde_params)
+        return np.sort(cuts)
     if "quantile_pts" in s:
         pts = s["quantile_pts"]
         if len(pts) <= n_edges:
@@ -112,11 +154,74 @@ def _make_num_edges(s: dict, K: int, rng: np.random.Generator) -> np.ndarray:
 
 def _make_cat_map(n_unique: int, K: int, rng: np.random.Generator) -> np.ndarray:
     """Randomly assign each category to a bin in [0, K-1]."""
+    if n_unique == 0:
+        return np.array([], dtype=np.int32)
+    # Guard: K=0 would cause division by zero; treat as K=1 (all → bin 0)
+    K_eff = max(K, 1)
     shuffled = rng.permutation(n_unique)
     cat_map = np.empty(n_unique, dtype=np.int32)
     for rank, orig in enumerate(shuffled):
-        cat_map[orig] = rank % K
+        cat_map[orig] = rank % K_eff
     return cat_map
+
+
+def apply_categorical_bin_cap(
+    col_stats: list[dict],
+    n_bins: int,
+    min_bins: int,
+    max_bins: int,
+    n: int,
+) -> dict[int, int]:
+    """Compute effective bin count per feature, applying categorical auto-capping.
+
+    For categorical features, returns ``clip(n_unique, min_bins, B_max)`` where
+    ``B_max = min(max_bins, Sturges(n))``.  For numerical features, no entry is
+    added to the returned dict so that the caller's default ``n_bins`` is used.
+
+    Parameters
+    ----------
+    col_stats : list[dict]
+        Per-column statistics from :func:`build_col_stats`.
+    n_bins : int
+        Fixed ``n_bins`` parameter (used for numerical features, not stored).
+    min_bins : int
+        Minimum allowed bins.
+    max_bins : int
+        Maximum allowed bins.
+    n : int
+        Number of samples (for Sturges rule).
+
+    Returns
+    -------
+    dict[int, int]
+        Mapping ``column_index -> effective_bin_count`` for categorical columns.
+        May be empty ``{}`` if no categorical features exist.
+    """
+    if min_bins > max_bins:
+        raise ValueError(f"min_bins ({min_bins}) > max_bins ({max_bins})")
+    if n_bins < 1:
+        raise ValueError(f"n_bins must be >= 1, got {n_bins}")
+    if n < 1:
+        raise ValueError(f"n must be >= 1, got {n}")
+
+    sturges_cap = int(np.ceil(np.log2(max(n, 2)) + 1))
+    B_max = min(max_bins, sturges_cap)
+
+    bins_map: dict[int, int] = {}
+    for j, s in enumerate(col_stats):
+        if s["type"] == "categorical":
+            n_cat = s.get("n_unique")
+            if n_cat is None:
+                n_cat = s.get("n_categories")
+            if n_cat is None:
+                raise ValueError(
+                    f"Categorical col_stats must have 'n_unique' or 'n_categories', got {s}"
+                )
+            n_bins_eff = max(min(n_cat, B_max), min_bins)
+            bins_map[j] = n_bins_eff
+        # numerical features: leave unset → caller uses default n_bins
+
+    return bins_map
 
 
 # ---------------------------------------------------------------------------
@@ -138,24 +243,67 @@ def compute_embedding(
     return np.column_stack(cols)  # (n, L) int64
 
 
+# 64-bit hash-combine constants (deterministic, platform-independent).
+# Folding per-feature bins into a hash rather than a positional mixed-radix
+# code avoids int64 overflow when n_features_per_iter * log2(K) > 63 bits
+# (which silently collapsed distinct cells onto the same id and corrupted the
+# Hamming distance).  The hash is a pure function of the per-feature bins, so
+# it stays out-of-sample-consistent (the same bin pattern maps to the same id
+# on training and new data), and it preserves the per-column equality relation
+# that the Hamming distance depends on.
+_HASH_INIT = np.uint64(1469598103934665603)   # FNV-1a 64-bit offset basis
+_HASH_GOLDEN = np.uint64(0x9E3779B97F4A7C15)  # 2^64 / golden ratio
+_HASH_S1 = np.uint64(6)
+_HASH_S2 = np.uint64(2)
+# Final ids are masked to 52 bits so they are < 2**53 and therefore exactly
+# representable as float64.  This matters because the Hamming distance is
+# computed with scipy.cdist, which casts the integer embedding to double;
+# full-range int64 ids (magnitude ~2**62) would collide under that cast and
+# silently zero out the distance matrix.  52 bits keeps collisions between
+# distinct cells astronomically unlikely while staying float64-exact.
+_HASH_MASK = np.uint64((1 << 52) - 1)
+
+
 def _cell_ids(X: np.ndarray, spec: IterationSpec) -> np.ndarray:
-    """Compute mixed-radix cell ID for one iteration. Returns (n,) int64."""
+    """Compute a collision-free cell ID for one iteration. Returns (n,) int64.
+
+    Each sample's per-feature bin assignments are folded into a 64-bit hash
+    (overflow-safe, order-sensitive, out-of-sample-consistent).  Two samples
+    share an id iff they fall in the same cell for this iteration.
+
+    NaN values in numerical columns are explicitly mapped to bin 0.
+    Categorical columns with n_unique=0 map all values to bin 0.
+    Features with K=0 are treated as having K=1 (single bin).
+    """
     n = X.shape[0]
-    K = spec.K
-    cell = np.zeros(n, dtype=np.int64)
-    power = np.int64(1)
+    cell = np.full(n, _HASH_INIT, dtype=np.uint64)
 
     for bs in spec.bin_specs:
         col = X[:, bs.col_idx]
+        K_j = bs.K if bs.K > 0 else spec.K
+        # Guard: K=0 is invalid — treat as single-bin
+        if K_j == 0:
+            K_j = 1
         if bs.type == "numerical":
+            # Explicitly map NaN/inf to bin 0 (searchsorted places NaN at len(edges))
+            finite_mask = np.isfinite(col)
             b = np.searchsorted(bs.edges, col, side="right").astype(np.int64)
-            b = np.clip(b, 0, K - 1)
+            b = np.clip(b, 0, K_j - 1)
+            b[~finite_mask] = 0  # NaN/inf → bin 0
         else:
-            col_int = col.astype(np.int64)
-            valid = (col_int >= 0) & (col_int < bs.n_unique)
-            mapped = bs.cat_map[np.clip(col_int, 0, bs.n_unique - 1)]
-            b = np.where(valid, mapped, np.int64(K - 1)).astype(np.int64)
-        cell += b * power
-        power *= K
+            # Guard: n_unique=0 means no valid categories at all
+            if bs.n_unique == 0:
+                b = np.zeros(n, dtype=np.int64)
+            else:
+                col_int = col.astype(np.int64)
+                valid = (col_int >= 0) & (col_int < bs.n_unique)
+                mapped = bs.cat_map[np.clip(col_int, 0, bs.n_unique - 1)]
+                b = np.where(valid, mapped, np.int64(K_j - 1)).astype(np.int64)
+        # boost-style hash_combine in uint64 (wraparound is intentional mixing)
+        b_u = b.astype(np.uint64)
+        cell = cell ^ (b_u + _HASH_GOLDEN + (cell << _HASH_S1) + (cell >> _HASH_S2))
 
-    return cell
+    # Mask to 52 bits (float64-exact) and return as int64.  Non-negative,
+    # bijective on the masked range, and preserves the equality / Hamming
+    # relation the rest of the library depends on.
+    return (cell & _HASH_MASK).astype(np.int64)
