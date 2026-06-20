@@ -1,534 +1,393 @@
-# ForestClustering: how the algorithm works
+# ForestClustering: Algorithm & Architecture
 
-> Document version matches the implementation in `forest_clustering/`.
+> Document version matches `forest_clustering` **0.4.0**.
 
 ---
 
 ## Contents
 
-1. [Overview: three steps](#1-overview-three-steps)
-2. [Step 1 — Feature encoding](#2-step-1--feature-encoding)
-3. [Step 2 — Building the embedding](#3-step-2--building-the-embedding)
-   - [One partitioning iteration](#31-one-partitioning-iteration)
-   - [Mixed-radix cell encoding](#32-mixed-radix-cell-encoding)
+1. [Architecture overview](#1-architecture-overview)
+2. [Step 1 — Feature Encoding](#2-step-1--feature-encoding)
+3. [Step 2 — Random Partitioning & Embedding](#3-step-2--random-partitioning--embedding)
+   - [One iteration](#31-one-iteration)
+   - [Cell-ID hashing](#32-cell-id-hashing)
    - [The n×L embedding matrix](#33-the-nl-embedding-matrix)
-   - [Uniform vs quantile cut-points](#34-uniform-vs-quantile-cut-points)
-4. [Step 3 — Distance estimation (Hamming)](#4-step-3--distance-estimation-hamming)
-   - [Why it works](#41-why-it-works)
-5. [Correlated-feature weighting](#5-correlated-feature-weighting)
-6. [Downstream algorithm recommendations](#6-downstream-algorithm-recommendations)
-7. [Parameters and tuning](#7-parameters-and-tuning)
-8. [Code structure](#8-code-structure)
+   - [Cut-point strategies](#34-cut-point-strategies)
+4. [Step 3 — Distance & Similarity](#4-step-3--distance--similarity)
+5. [Step 4 — Downstream Clustering](#5-step-4--downstream-clustering)
+6. [Advanced mechanisms](#6-advanced-mechanisms)
+   - [Adaptive bins](#61-adaptive-bins)
+   - [Correlation-aware selection](#62-correlation-aware-selection)
+   - [Iteration weighting](#63-iteration-weighting)
+   - [Contrastive trees](#64-contrastive-trees)
+   - [LSH-banding kNN graph](#65-lsh-banding-knn-graph)
+7. [Online / incremental mode](#7-online--incremental-mode)
+8. [Code map](#8-code-map)
 
 ---
 
-## 1. Overview: three steps
-
-ForestClusterer builds a similarity measure between observations through **repeated random partitioning** of the feature space — analogous to IsolationForest, but instead of tree depth it counts how often pairs of points fall into the same "cell".
+## 1. Architecture overview
 
 ```mermaid
 flowchart TD
-    A["Input data X\n(DataFrame or ndarray)\nany feature types"] --> B
+    A["Input X<br/>DataFrame or ndarray<br/>mixed types"] --> B["Step 1: DataEncoder<br/>auto-detect types<br/>label-encode categorical<br/>→ float64 matrix X_enc"]
 
-    B["Step 1: DataEncoder\nAuto-detect types\nLabel-encode categoricals"] --> C
+    B --> C["Step 2: Partitioning Engine<br/>L independent iterations<br/>parallel (joblib)"]
 
-    C["Step 2: L partitioning iterations\nparallel — joblib"] --> C1 & C2 & C3
+    C --> C1["Iteration 1<br/>select m features<br/>draw cuts → cell IDs"]
+    C --> C2["Iteration 2<br/>..."]
+    C --> C3["Iteration L<br/>..."]
 
-    C1["Iteration 1\nfeature selection → K bins\n→ cell_id for each point"]
-    C2["Iteration 2\n..."]
-    C3["Iteration L\n..."]
+    C1 & C2 & C3 --> D["Embedding E<br/>n × L int64<br/>E[i,l] = cell_id"]
 
-    C1 & C2 & C3 --> D
+    D --> E1["Step 3a: Hamming distance<br/>D[i,j] = fraction of differing cells<br/>∈ [0,1], float32"]
+    D --> E2["Step 3b: Weighted one-hot<br/>sparse CSR φ<br/>||φ_i−φ_j||² = weighted Hamming"]
+    D --> E3["Step 3c: LSH-banding kNN<br/>sparse graph G<br/>for Louvain / Leiden"]
 
-    D["Embedding E\nn×L int64 matrix\nE[i, l] = cell_id of point i at iteration l"]
-
-    D --> E1 & E2
-
-    E1["Step 3a: Hamming distance\nD[i,j] = fraction of iterations\nwhere cell_id i ≠ cell_id j\n∈ [0, 1], float32, n×n\n(computed on demand)"]
-
-    E2["Step 3b: Downstream clusterer\nKMeans on E\nor AgglClust/HDBSCAN on D"]
-
-    E1 --> F["Cluster labels"]
+    E1 --> F["Step 4: Downstream clusterer<br/>KMeans / AgglClust / DBSCAN / Louvain / Leiden<br/>→ labels"]
     E2 --> F
+    E3 --> F
 ```
 
-**Key property**: the explicit n×n distance matrix is **not stored in memory** during training. The n×L embedding is a compact enough representation from which distances are computed on demand.
+**Key invariant:** the dense `n × n` distance matrix is **never materialised** for large `n`. The `n × L` embedding (`L ≈ 200`) is the only compact representation kept in memory.
 
 ---
 
-## 2. Step 1 — Feature encoding
+## 2. Step 1 — Feature Encoding
 
-`DataEncoder` (`feature_encoder.py`) automatically determines the type of each feature and converts the data to a uniform float64 array.
+`DataEncoder` (`feature_encoder.py`) inspects each column and decides whether it is **numerical** or **categorical**.
 
 ```mermaid
 flowchart LR
-    A["Column X"] --> B{{"Type?"}}
-
-    B -->|"object / category dtype"| C["Categorical"]
-    B -->|"int/float, n_unique ≤ cat_threshold\n(default=10)"| C
+    A["Column X_j"] --> B{{"Type?"}}
+    B -->|"object / category / bool"| C["Categorical"]
+    B -->|"int/float, n_unique ≤ cat_threshold"| C
     B -->|"int/float, n_unique > cat_threshold"| D["Numerical"]
-
-    C --> C1["LabelEncoder\nknown values → 0..n_unique-1\nNaN / unknown → -1"]
-    D --> D1["Passed through as-is\n(float64)"]
-
-    C1 --> E["float64 array X_encoded"]
-    D1 --> E
+    C --> C1["LabelEncoder<br/>known → 0..U-1<br/>NaN / unknown → -1"]
+    D --> D1["Pass through as float64"]
+    C1 & D1 --> E["X_enc<br/>n × d float64"]
 ```
 
 | Behaviour | Numerical | Categorical |
-|-----------|-----------|-------------|
-| fit_transform | values preserved | LabelEncoder → 0..n-1 |
-| transform (new data) | values preserved | unknown category → -1 |
-| NaN | preserved as NaN | → -1 |
-| `feature_types_override` | type can be forced | type can be forced |
+|---|---|---|
+| `fit_transform` | values preserved | label-encoded to `0 … U-1` |
+| `transform` (new data) | values preserved | unknown category → `-1` |
+| NaN | preserved as NaN | mapped to `-1` |
+| Override | `feature_types={col: "numerical"}` | `feature_types={col: "categorical"}` |
 
-> **Why**: categorical features are partitioned differently from numerical ones. `DataEncoder` ensures that `partitioner.py` knows the type of every column.
+**Smart auto-detection** (`auto_feature_types='smart'`):
+* datetime → numerical (timestamp)
+* integer with ID-like name (`_id`, `user_id`, …) and high cardinality → numerical
+* low-cardinality integer → categorical
+* float values that are actually integers (`1.0, 2.0`) → categorical if cardinality is low
 
 ---
 
-## 3. Step 2 — Building the embedding
+## 3. Step 2 — Random Partitioning & Embedding
 
-### 3.1 One partitioning iteration
+### 3.1 One iteration
 
-Each of the L iterations is independent. In each iteration:
+Each of the `L` iterations is independent.
 
 ```mermaid
 flowchart TD
-    A["X_encoded\nn × d, float64"] --> B
-
-    B["Select M features\n(Gumbel-max trick,\nweighted, without replacement)"] --> C
-
-    C["For each\nselected feature f"] --> D{{"Type of f?"}}
-
-    D -->|"Numerical"| E["Create K bins:\nrandom cut-points\nfrom [min_f, max_f]\n(or quantiles if quantile_cuts=True)"]
-    D -->|"Categorical"| F["Create K bins:\nrandom permutation\nof unique values,\nsplit round-robin into K groups"]
-
-    E --> G["bin_f(x) = np.searchsorted(edges, x)\n∈ {0, 1, ..., K-1}"]
-    F --> H["bin_f(x) = cat_map.get(x, K-1)\n(unknown → last bin)"]
-
-    G & H --> I
-
-    I["Mixed-radix encoding:\ncell_id = bin_f1 + K·bin_f2 + K²·bin_f3 + ...\nscalar int64"] --> J
-
-    J["Column l of embedding:\nE[:, l] = cell_ids\nn int64 values"]
+    A["X_enc<br/>n × d"] --> B["Select m features<br/>Gumbel-max trick<br/>weighted without replacement"]
+    B --> C["For each selected feature f"]
+    C --> D{{"Type of f?"}}
+    D -->|"Numerical"| E["Draw K−1 cut-points<br/>uniform / quantile / KDE peaks"]
+    D -->|"Categorical"| F["Shuffle categories<br/>round-robin into K bins"]
+    E --> G["bin_f(x) = searchsorted(edges, x)<br/>∈ {0,…,K-1}<br/>NaN → bin 0"]
+    F --> H["bin_f(x) = cat_map[x]<br/>unknown → K-1"]
+    G & H --> I["Hash-combine per-feature bins<br/>→ cell_id (int64)"]
+    I --> J["E[:, l] = cell_ids"]
 ```
 
-**Number of features M** is controlled by the `n_features` parameter:
-- `'sqrt'` → `ceil(sqrt(d))`
-- `'log2'` → `ceil(log2(d))`
-- `int` → fixed count
-- `float` → fraction of d
+**Feature selection.** `m` is controlled by `n_features`:
+* `"sqrt"` → `ceil(sqrt(d))`
+* `"log2"` → `ceil(log2(d))`
+* `int` → fixed count
+* `float` → fraction of `d`
 
-### 3.2 Mixed-radix cell encoding
-
-A cell is a tuple of bins `(bin_f1, bin_f2, ..., bin_fM)`, packed into a single int64 via a mixed-radix scheme (analogous to representing a number in base K):
+The **Gumbel-max trick** implements weighted sampling without replacement in `O(d)`:
 
 ```
-cell_id = bin_f1 + K·bin_f2 + K²·bin_f3 + ... + K^(M-1)·bin_fM
+score_j = log(weight_j) + Gumbel(0,1)
+select top-m scores
 ```
 
-**Example**: K=3, M=3 features, bins = (2, 0, 1)
+### 3.2 Cell-ID hashing
 
+A cell is a tuple of bins `(b₁, b₂, …, b_m)`. Instead of a mixed-radix positional code (which overflows `int64` when `m·log₂(K) > 63`), the implementation uses a **64-bit FNV-1a style hash-combine**:
+
+```python
+HASH_INIT  = 1469598103934665603   # FNV-1a offset basis
+HASH_GOLDEN = 0x9E3779B97F4A7C15   # 2^64 / φ
+
+h = HASH_INIT
+for each bin b in (b1, b2, ..., bm):
+    h = h ^ (b + HASH_GOLDEN + (h << 6) + (h >> 2))
+
+cell_id = h & ((1 << 52) - 1)      # mask to 52 bits
 ```
-cell_id = 2 + 3·0 + 9·1 = 11
-```
 
-| M | K | Unique cells | int64 range |
-|---|---|--------------|-------------|
-| 3 | 3 | 27 | 0–26 |
-| 4 | 3 | 81 | 0–80 |
-| 5 | 3 | 243 | 0–242 |
-| 3 | 4 | 64 | 0–63 |
-| 4 | 4 | 256 | 0–255 |
+**Why 52 bits?** `float64` has 53 bits of mantissa. Masking to 52 guarantees that every `cell_id` is **exactly representable** as `float64`. This matters because `scipy.spatial.distance.cdist` casts the embedding to double; full-range `int64` ids would collide silently and zero out the distance matrix.
 
-> **Why**: two observations in the same cell means they simultaneously fell into the same bin **across all M selected features**. This is a stricter condition than falling into the same bin per feature individually.
+The hash is a pure function of the bin tuple, so the same tuple always maps to the same id on training and new data (out-of-sample consistency).
 
 ### 3.3 The n×L embedding matrix
 
-After L iterations each observation is described by a vector of L cell_ids:
+After `L` iterations each point is described by a vector of cell ids:
 
 ```
-         iter_0   iter_1   iter_2  ...  iter_L-1
-point_0 [  11      24        3    ...     7    ]
-point_1 [  11       5        3    ...    42    ]
-point_2 [   7      24       18    ...     7    ]
-point_3 [   3       5        9    ...    42    ]
+          iter_0   iter_1   iter_2  …  iter_{L-1}
+point_0 [   11       24        3    …      7    ]
+point_1 [   11        5        3    …     42    ]
+point_2 [    7       24       18    …      7    ]
+point_3 [    3        5        9    …     42    ]
 ```
 
-In this example:
-- **points 0 and 1** matched in iterations 0 and 2 (→ similar under these partitions)
-- **points 0 and 2** matched in iterations 1 and L-1
-- **points 1 and 3** matched in iterations 1 and L-1
+*Points 0 and 1* matched in iterations 0 and 2 → they are similar under these random projections. Hamming distance simply counts how many iterations they **did not** match.
 
-Hamming distance counts **how many iterations** a pair did NOT match.
+### 3.4 Cut-point strategies
 
-```mermaid
-block-beta
-  columns 6
-  space:1 l0["iter 0"]:1 l1["iter 1"]:1 l2["iter 2"]:1 ldot["..."]:1 lL["iter L-1"]:1
+Three strategies are available for numerical features.
 
-  p0["point 0"]:1 e00["11"]:1 e01["24"]:1 e02["3"]:1 edot0["..."]:1 e0L["7"]:1
-  p1["point 1"]:1 e10["11"]:1 e11["5"]:1 e12["3"]:1 edot1["..."]:1 e1L["42"]:1
-  p2["point 2"]:1 e20["7"]:1 e21["24"]:1 e22["18"]:1 edot2["..."]:1 e2L["7"]:1
-
-  style e00 fill:#c8e6c9
-  style e10 fill:#c8e6c9
-  style e02 fill:#c8e6c9
-  style e12 fill:#c8e6c9
-```
-
-*Green — matches between points 0 and 1 (d(0,1) = 1 - 2/L).*
-
-### 3.4 Uniform vs quantile cut-points
-
-The `quantile_cuts` parameter controls how cut-points are chosen for **numerical** features:
+| Strategy | Mechanism | When to use |
+|---|---|---|
+| **uniform** (default) | `rng.uniform(min, max, size=K-1)` | Fast, no outliers |
+| **quantile** | random sample from empirical quantiles | Outlier-robust |
+| **kde_peaks** | detect valleys between KDE peaks, place cuts there | Density-aware, multimodal data |
 
 ```mermaid
 flowchart LR
-    subgraph uniform["quantile_cuts=False (default)"]
-        direction TB
-        U1["Cut-points:\nlinspace(min, max, K-1)\nuniformly over the value range"]
-        U2["Problem:\nan outlier x=1000 with a normal\nrange of [0, 100] stretches the scale.\nAll normal points fall\ninto one bin [0, 1000/3)."]
+    subgraph uniform["uniform (default)"]
+        U1["Cuts: linspace(min, max)"]
+        U2["Outlier x=1000 stretches range<br/>→ normal points collapse into one bin"]
         U1 --> U2
     end
-
-    subgraph quantile["quantile_cuts=True"]
-        direction TB
-        Q1["Cut-points:\nrandom sample from\ndata quantiles\n(percentiles 0..100)"]
-        Q2["Outlier x=1000 gets\nthe extreme bin (99th percentile+).\nNormal points spread\nevenly across K bins."]
+    subgraph quantile["quantile"]
+        Q1["Cuts: sampled from data quantiles"]
+        Q2["Outlier gets extreme bin<br/>→ normal points spread evenly"]
         Q1 --> Q2
     end
-
-    uniform -->|"with outliers"| FAIL["❌ normal points\nin one bin\n→ all d(i,j) ≈ 1\neven for close points"]
-    quantile -->|"with outliers"| OK["✅ normal points\nspread across bins\n→ correct distances\nwithin the normal range"]
+    subgraph kde["kde_peaks"]
+        K1["KDE → find peaks & valleys"]
+        K2["Cuts placed in valleys<br/>between density modes"]
+        K1 --> K2
+    end
 ```
 
-**Summary**: `quantile_cuts=True` is the main tool for outlier robustness. An outlier with fare=1000 simply gets bin K-1 but does not shift the cut-points for fare in the range [0, 200].
+**KDE peaks** (`kde_cuts.py`) workflow:
+1. Subsample large columns (>10 000 rows).
+2. Estimate bandwidth (Silverman / Scott rule, clamped to `range × 1e-4`).
+3. Evaluate Gaussian KDE on a grid.
+4. Find peaks with `scipy.signal.find_peaks`.
+5. Reject flat KDEs (guard against sampling noise).
+6. Select valleys by depth + balance score.
+7. Fall back to uniform if not enough valleys are found.
 
 ---
 
-## 4. Step 3 — Distance estimation (Hamming)
+## 4. Step 3 — Distance & Similarity
 
-Hamming distance between points i and j over the embedding:
+### Hamming distance
 
 ```
-d(i, j) = (1/L) · Σ_l [ I(E[i, l] ≠ E[j, l]) ]   ∈ [0, 1]
+D[i,j] = (1/L) · Σ_l 1{ E[i,l] ≠ E[j,l] }   ∈ [0, 1]
 ```
 
-| E[i, l] | E[j, l] | Match | Contribution to d(i,j) |
-|---------|---------|-------|------------------------|
-| 11      | 11      | ✓ | 0 |
-| 24      | 5       | ✗ | 1/L |
-| 3       | 3       | ✓ | 0 |
-| ...     | ...     | ... | ... |
+Implementation uses `scipy.spatial.distance.cdist(..., metric='hamming')`. For `n > 2000` a chunked variant builds the matrix row-by-row to limit memory.
 
-**Implementation** (`distance.py`): computed via `scipy.spatial.distance.cdist(E, E, metric='hamming')`, treating each cell_id as a single "feature" value. Returns `float32`, n×n.
+### Weighted Hamming
+
+When `iteration_weighting` is `"entropy"` or `"inverse_gini"`, each iteration `l` receives a weight `w_l` (mean-normalised to 1.0):
+
+```
+D_weighted[i,j] = Σ_l w_l · 1{ E[i,l] ≠ E[j,l] } / Σ_l w_l
+```
+
+* **entropy** — rewards iterations with high cell-diversity (high Shannon entropy).
+* **inverse_gini** — rewards iterations with balanced cell sizes (low Gini inequality).
+* **temperature** — `T < 1` sharpens differences, `T > 1` softens them.
+
+Fast paths: `numba` parallel kernels, or cache-friendly chunked numpy with `joblib` threading.
+
+### Sparse weighted one-hot features
+
+For centroid estimators (KMeans, MiniBatchKMeans, Birch) the embedding is expanded into a **sparse CSR matrix** with exactly `L` non-zeros per row:
 
 ```python
-# From pairwise_hamming():
-E_f = embedding.astype(np.float32)          # n × L
-D = cdist(E_f, E_f, metric='hamming')       # n × n, float32
-# For large n — chunked variant pairwise_hamming_chunked()
+# For iteration l with weight w_l and cell c:
+phi[i, offset_l + c] = sqrt(w_l / 2)
 ```
 
-### 4.1 Why it works
+Then:
 
-```mermaid
-flowchart LR
-    subgraph close["Close points (same cluster)"]
-        direction TB
-        C1["Similar feature values:\nfare=150, age=35\nvs fare=160, age=33"]
-        C2["In most iterations\nfall into the same bins\n→ identical cell_id"]
-        C3["d(i, j) → 0\n(many matches)"]
-        C1 --> C2 --> C3
-    end
-
-    subgraph far["Distant points (different clusters)"]
-        direction TB
-        F1["Different values:\nfare=500 vs fare=10"]
-        F2["In most iterations\nin different bins\n→ different cell_id"]
-        F3["d(i, j) → 1\n(few matches)"]
-        F1 --> F2 --> F3
-    end
-
-    subgraph outlier["Outlier (with quantile_cuts=True)"]
-        direction TB
-        O1["fare=3000 — extreme value"]
-        O2["Always in extreme bin K-1\nfor the fare feature"]
-        O3["Other features behave normally.\nd(outlier, normal) → high\nd(normal, normal) — unaffected"]
-        O1 --> O2 --> O3
-    end
+```
+||phi_i - phi_j||² = Σ_l w_l · 1{E[i,l] ≠ E[j,l]} = weighted Hamming
 ```
 
-**Key point**: the distance is bounded in [0, 1] by construction. A single outlier with an extreme fare value cannot make d(i, j) > 1 for its neighbors. This is fundamentally different from Euclidean distance, where fare=3000 shifts the KMeans centroid by hundreds of units.
+This makes KMeans optimise a weighted-Hamming-consistent objective while staying `O(n·L)` in memory, regardless of per-column cardinality.
 
 ---
 
-## 5. Correlated-feature weighting
+## 5. Step 4 — Downstream Clustering
 
-`correlation.py` detects groups of strongly correlated features and reduces their combined sampling weight.
+`ForestClusterer` automatically routes the embedding to the clusterer in the correct format:
 
 ```mermaid
 flowchart TD
-    A["X_encoded\nn×d float64"] --> B
-
-    B["If n > sample_size:\nrandom subsample\n(default: 10 000 rows)"] --> C
-
-    C["Spearman correlation matrix\nd×d\n(scipy.stats.spearmanr)"] --> D
-
-    D["Build adjacency graph:\nedge (i, j) if\n|corr(i,j)| > corr_threshold\n(default: 0.9)"] --> E
-
-    E["Connected components\n(scipy.sparse.csgraph.\nconnected_components)\n→ groups G1, G2, ..."] --> F
-
-    F["Feature weight:\nweight(f) = 1 / |G_f|\nwhere |G_f| = group size\n(1 if feature is singleton)"] --> G
-
-    G["Gumbel-max trick\nfor weighted selection\nof M features without replacement:\nu ~ Uniform(0,1)\nscore = -log(-log(u)) + log(weight)\nselect top-M by score"]
+    A["Clusterer choice"] --> B{{"String shortcut?"}}
+    B -->|"'louvain' / 'leiden'"| C["GraphLouvainClusterer<br/>kNN graph → community detection"]
+    B -->|"estimator"| D{{"metric / type"}}
+    D -->|"metric='precomputed'"| E["pairwise_distance()<br/>dense D n×n<br/>→ estimator.fit_predict(D)"]
+    D -->|"centroid (KMeans, Birch, …)"| F["weighted_onehot_features(E)<br/>sparse CSR<br/>→ estimator.fit_predict(φ)"]
+    D -->|"metric='hamming'"| G["raw embedding E<br/>→ estimator.fit_predict(E)"]
 ```
 
-**Example**: cont_1 and corr_1 (= cont_1 + ε, |Spearman| ≈ 0.999 > 0.9) fall into the same group.
+| Algorithm | Input format | Best for |
+|---|---|---|
+| KMeans / MiniBatchKMeans / Birch | sparse weighted one-hot `φ` | Known `K`, any `n` |
+| AgglomerativeClustering (`precomputed`) | dense Hamming matrix `D` | Non-spherical, `n ≤ 12 000` |
+| DBSCAN (`metric='hamming'`) | raw embedding `E` | Unknown `K`, noise |
+| Louvain / Leiden | LSH-banding kNN graph | Large `n`, no `K` needed |
 
-| Feature | Group | Size G | Weight = 1/G | Sampling probability |
-|---------|-------|--------|--------------|----------------------|
-| cont_1  | {cont_1, corr_1} | 2 | 0.5 | half as likely |
-| corr_1  | {cont_1, corr_1} | 2 | 0.5 | half as likely |
-| cont_2  | {cont_2} | 1 | 1.0 | normal |
-| noise_1 | {noise_1} | 1 | 1.0 | normal |
-
-> **Why corr_threshold=0.9 and not 0.7?** At 0.7 the "ecological correlation" fires: features that are informative for different clusters can correlate with each other in the mixture (Simpson's paradox). A threshold of 0.9 ensures we only catch direct linear duplicates, not inter-cluster patterns.
+**Size-aware routing.** For `n ≤ 12 000` the Louvain/Leiden path uses the exact dense Hamming matrix (classic behaviour, exact tie-breaking). For `n > 12 000` it switches to the **matrix-free LSH-banding kNN graph** so `O(n²)` memory is never allocated.
 
 ---
 
-## 6. Downstream algorithm recommendations
+## 6. Advanced mechanisms
 
-ForestClusterer accepts any sklearn-compatible clusterer. The algorithm is chosen automatically:
+### 6.1 Adaptive bins
+
+Instead of a fixed `K` for all features, `adaptive_bins=True` computes per-feature bin counts from column statistics:
+
+```python
+# Score components:
+c_spread = IQR / range          # how spread out is the data?
+c_unique = n_unique / (2·sqrt(n))  # cardinality signal
+
+C = 0.5·c_spread + 0.5·c_unique   # composite score ∈ [0,1]
+K_j = round(min_bins + (max_bins - min_bins) · C)
+```
+
+Categorical features automatically get `K_j = clip(n_unique, min_bins, B_max)` where `B_max = min(max_bins, Sturges(n))`.
+
+### 6.2 Correlation-aware selection
+
+Two layers of correlation handling exist:
+
+1. **Feature weights** (`corr_threshold`): strongly correlated features get weight `1/G` where `G` is group size. This reduces selection probability but does not forbid co-selection.
+2. **Correlation-aware selection** (`correlation_aware=True`): at most **one** feature per correlated group is selected in a single iteration. This guarantees diversity within each random partition.
 
 ```mermaid
 flowchart TD
-    A["Choose downstream clusterer"] --> B{{"clusterer.metric\n== 'precomputed'?"}}
-
-    B -->|"Yes"| C["Compute pairwise distance matrix D\nn×n float64\nPass D to clusterer.fit_predict(D)"]
-    B -->|"No"| D["Pass embedding E\nn×L int64\nDirectly to clusterer.fit_predict(E)"]
-
-    C --> C1["AgglomerativeClustering\n(metric='precomputed')"]
-    C --> C2["HDBSCAN\n(metric='precomputed')"]
-    D --> D1["KMeans on embedding"]
-    D --> D2["DBSCAN\n(metric='hamming')"]
-    D --> D3["MiniBatchKMeans\nfor large n"]
+    A["Numerical columns"] --> B["Pearson correlation matrix"]
+    B --> C["Graph: edge if |r| > threshold"]
+    C --> D["Connected components → groups"]
+    D --> E["Group importance = max weight in group"]
+    E --> F["Weighted random selection of groups"]
+    F --> G["Pick highest-weight feature from each selected group"]
 ```
 
-### Algorithm comparison
+### 6.3 Iteration weighting
 
-| Algorithm | When to use | Pros | Cons |
-|-----------|-------------|------|------|
-| **KMeans on E** | Known K, any n | Fast, stable, outliers don't shift centroid in E-space | K must be known, spherical clusters in Hamming space |
-| **AgglClust(precomputed, average)** | Non-round clusters, n ≤ 50K | Flexible cluster shape | O(n²) memory, slow at n > 50K |
-| **AgglClust(precomputed, complete)** | Compact clusters, no chains | Robust to "bridges" | May underestimate elongated clusters |
-| **DBSCAN(metric='hamming') on E** | Unknown K, noise present | Outlier detection, any K | Requires eps tuning |
-| **HDBSCAN(metric='precomputed') on D** | Variable-density clusters, outliers | Automatic K, outlier isolation | Needs float64, n ≤ 100K |
-| **MiniBatchKMeans on E** | n > 500K | Scales | Approximate, lower quality |
+After the embedding is built, each iteration is scored by the uniformity of its cell-size distribution:
 
-### Concrete recommendations
+* **entropy** — `w_l ∝ H(cell_distribution) / log(n_unique)`
+* **inverse_gini** — `w_l ∝ Gini_uniformity / Gini_max`
 
-#### Task: standard clustering with known K
+Iterations that split data into a few giant cells (low information) receive near-zero weight; iterations with fine, balanced splits receive high weight.
 
-```python
-from sklearn.cluster import KMeans
-from forest_clustering import ForestClusterer
+### 6.4 Contrastive trees
 
-clf = ForestClusterer(
-    n_iterations=300,
-    n_bins=3,
-    quantile_cuts=True,           # required when data contains outliers
-    clusterer=KMeans(n_clusters=K, random_state=0, n_init=10),
-    corr_threshold=0.9,
-    random_state=42,
-)
-labels = clf.fit_predict(X)
-```
+When `contrastive=True`, each iteration builds a small decision tree (max depth ≈ `max(3, n_bins)`) optimised with a contrastive loss:
 
-> KMeans operates directly on the embedding (int64). In Hamming-embedding space, clusters tend to be spherical, so KMeans is effective.
+1. Run KMeans on the node to get pseudo-labels.
+2. Generate positive pairs (same label) and negative pairs (different labels).
+3. At each split, evaluate:
+   ```
+   score = -contrastive_loss + 0.1 · information_gain
+   ```
+4. The tree structure is stored (not just leaf ids), so `transform()` on new data is consistent.
 
-#### Task: unknown K, outlier detection needed
+This learns partitions that separate known pseudo-clusters rather than cutting randomly.
 
-```python
-from sklearn.cluster import DBSCAN
-from forest_clustering import ForestClusterer
+### 6.5 LSH-banding kNN graph
 
-clf = ForestClusterer(
-    n_iterations=300,
-    n_bins=3,
-    quantile_cuts=True,
-    # DBSCAN(metric='hamming') works directly on the embedding,
-    # without computing the n×n matrix:
-    clusterer=DBSCAN(metric='hamming', eps=0.3, min_samples=15),
-    random_state=42,
-)
-labels = clf.fit_predict(X)
-# labels == -1 → outlier/noise
-```
+For large `n` the exact `n × n` distance matrix is infeasible. The LSH-banding graph builder (`lsh_graph.py`) works directly on the embedding:
 
-> `eps` is selected via k-distance plot: compute Hamming distance to the k-th neighbor on a subsample, take the elbow.
+1. **Compact codes** — factorise each column to the smallest `uint8/16/32` dtype preserving equality.
+2. **Banding** — split `L` columns into bands of size `r`. Rows sharing the exact same tuple in a band are candidate neighbours.
+3. **Vectorised pair enumeration** — within each bucket, all `i < j` pairs are generated via a closed-form triangular inverse (no Python loops).
+4. **Exact Hamming on candidates** — compute true distance only for candidates.
+5. **Per-row top-k** — a single packed-key `argsort` keeps the `k` nearest neighbours per row.
 
-#### Task: complex-shaped clusters, n ≤ 50K
-
-```python
-from sklearn.cluster import AgglomerativeClustering
-from forest_clustering import ForestClusterer
-
-clf = ForestClusterer(
-    n_iterations=200,
-    n_bins=3,
-    quantile_cuts=True,
-    clusterer=AgglomerativeClustering(
-        n_clusters=K,
-        metric='precomputed',
-        linkage='average',    # 'average' for elongated clusters
-                              # 'complete' for compact ones
-    ),
-    random_state=42,
-)
-labels = clf.fit_predict(X)  # internally computes the full n×n matrix D
-```
-
-> **Warning**: `linkage='single'` causes chaining — don't use it. `linkage='ward'` requires euclidean — incompatible with precomputed.
-
-#### Task: large data (n > 100K)
-
-```python
-from sklearn.cluster import MiniBatchKMeans
-from forest_clustering import ForestClusterer
-
-# Step 1: fit on a subsample
-idx_sample = np.random.choice(len(X), size=20_000, replace=False)
-clf = ForestClusterer(
-    n_iterations=200,
-    n_bins=3,
-    quantile_cuts=True,
-    clusterer=MiniBatchKMeans(n_clusters=K, random_state=0),
-    random_state=42,
-)
-clf.fit(X[idx_sample])
-
-# Step 2: transfer embedding to the full set
-E_full = clf.transform(X)           # n_full × L
-labels = clf.clusterer.predict(E_full)
-```
-
-#### Task: exploratory analysis, K unknown
-
-```python
-# Obtain embedding and distance matrix, cluster externally
-clf = ForestClusterer(n_iterations=300, n_bins=3, quantile_cuts=True, random_state=42)
-clf.fit(X)
-
-E = clf.get_embedding()             # n × L, int64
-D = clf.pairwise_distance()         # n × n, float32 ∈ [0, 1]
-# D.astype(np.float64) — if required for HDBSCAN
-
-# Dendrogram analysis for selecting K:
-from scipy.cluster.hierarchy import linkage, dendrogram
-Z = linkage(D, method='average')
-dendrogram(Z)
-```
-
-### What NOT to do
-
-| Mistake | Why | Correct approach |
-|---------|-----|-----------------|
-| `AgglClust(linkage='single', metric='precomputed')` | chaining: one "bridge" merges clusters | `linkage='average'` or `'complete'` |
-| `AgglClust(linkage='ward', metric='precomputed')` | ward requires euclidean, will raise an error | `linkage='average'` |
-| `HDBSCAN(metric='precomputed')` without `.astype(float64)` | hdbscan requires float64, but `pairwise_distance()` returns float32 | ForestClusterer automatically casts `.astype(float64)` before passing to the clusterer |
-| `quantile_cuts=False` with outlier-heavy data | outliers stretch the range, normal points collapse into one bin | `quantile_cuts=True` |
-| `corr_threshold=0.7` on mixed-cluster data | ecological correlation — informative features get grouped | `corr_threshold=0.9` |
-| Large `n_bins` (K > 5) with few iterations | few points per cell → distances ≈ 1 everywhere | K=3, L≥200 |
+Memory is `O(n·c)` where `c` is the candidate count, never `O(n²)`. `band_size='auto'` picks the smallest band size that keeps collision load bounded.
 
 ---
 
-## 7. Parameters and tuning
+## 7. Online / incremental mode
 
-| Parameter | Default | Recommendation |
-|-----------|---------|----------------|
-| `n_iterations` | 200 | 200–500: more → more stable, slower. For n<1000: 100 is enough |
-| `n_features` | `'sqrt'` | `'sqrt'` — standard. `'log2'` for high-dimensional data (d > 100) |
-| `n_bins` | 3 | K=3 — good balance. K=2 — binary (faster, less precise). K>5 rarely needed |
-| `quantile_cuts` | `False` | `True` when outliers or skewed distributions are present |
-| `corr_threshold` | `0.7` | Recommend `0.9` on real data (avoid ecological correlation) |
-| `corr_sample_size` | `10_000` | Reduce to 5000 if d < 20 and speed is needed |
-| `n_jobs` | `-1` | `-1` = all cores. Threading backend (GIL not an issue for NumPy) |
-| `random_state` | `None` | Set for reproducibility |
-| `clusterer` | `None` → DBSCAN | For known K: `KMeans`. For compact clusters: `AgglClust(precomputed)` |
+`partial_fit` allows the clusterer to ingest new data without a full refit:
 
-### Diagnostics: what to inspect
-
-```python
-clf.fit(X)
-
-# 1. Feature weights — verify correlations are detected correctly
-print(dict(zip(feature_names, clf.feature_weights_)))
-# Expected: correlated features get 0.5 (if group of 2)
-
-# 2. Embedding size
-print(clf.embedding_.shape)   # (n, L)
-print(clf.embedding_.dtype)   # int64
-
-# 3. Distance distribution (subsample)
-D = clf.pairwise_distance()
-import numpy as np
-print(f"mean={D.mean():.3f}, std={D.std():.3f}, min={D.min():.3f}, max={D.max():.3f}")
-# If mean ≈ 1 — try quantile_cuts=True or reduce n_bins
-# If mean ≈ 0 — too few iterations or n_bins=1
+```mermaid
+flowchart TD
+    A["partial_fit(X_new)"] --> B["Encode X_new with existing encoder"]
+    B --> C["Compute embedding with current specs"]
+    C --> D["Append to accumulated embedding"]
+    D --> E["Update column statistics"]
+    E --> F{"Drift detected?"}
+    F -->|"Yes"| G["Rebuild iteration specs<br/>from accumulated stats"]
+    F -->|"No"| H["Keep current specs"]
+    G --> I["Recompute ALL embeddings"]
+    H --> J["Re-run clusterer on full embedding"]
+    I --> J
 ```
+
+Drift is measured per-feature as `max(|Δmean|, |Δstd|) / std_ref`. If the fraction of drifted features exceeds `partial_fit_rebuild_threshold`, the specs are rebuilt. The accumulated data is capped to `partial_fit_max_samples` to prevent unbounded growth.
 
 ---
 
-## 8. Code structure
+## 8. Code map
 
 ```
 forest_clustering/
-├── __init__.py               # exports ForestClusterer + distance functions
-├── clusterer.py              # ForestClusterer (BaseEstimator, ClusterMixin)
-│   ├── fit()                 # DataEncoder → compute_feature_weights → build_iteration_specs
-│   │                         # → compute_embedding → stores specs and embedding_
-│   ├── fit_predict()         # fit + _run_clusterer
-│   ├── transform()           # applies stored specs to new data
-│   ├── get_embedding()       # returns embedding_ (n×L)
-│   ├── pairwise_distance()   # Hamming D from embedding (or cross_hamming for X,Y)
-│   └── _run_clusterer()      # if metric=='precomputed': D → clusterer; else E → clusterer
-│
-├── partitioner.py            # all partitioning logic
-│   ├── BinSpec               # dataclass: col_idx, type, edges or cat_map
-│   ├── IterationSpec         # dataclass: list[BinSpec], K
-│   ├── build_col_stats()     # min/max or quantile_pts for each column
-│   ├── build_iteration_specs()  # L IterationSpec objects
-│   ├── compute_embedding()   # joblib Parallel → n×L int64
-│   ├── _cell_ids()           # X + spec → (n,) int64 (mixed-radix encoding)
-│   ├── _make_num_edges()     # K-1 cut-points (uniform or quantile)
-│   ├── _make_cat_map()       # value → bin dict
-│   └── _weighted_choice_no_replace()  # Gumbel-max trick
-│
-├── feature_encoder.py        # DataEncoder
-│   ├── fit_transform()       # detects types, encodes
-│   └── transform()           # applies to new data
-│
-├── correlation.py            # compute_feature_weights()
-│   ├── Spearman on subsample → d×d matrix
-│   ├── graph |corr| > threshold
-│   ├── connected_components → groups
-│   └── weight = 1/G per feature
-│
-└── distance.py               # pairwise_hamming, pairwise_hamming_chunked, cross_hamming
-    # scipy.spatial.distance.cdist(E, E, metric='hamming') → float32
-    # chunked variant for n > 5000 (memory efficient)
+├── __init__.py               # public exports
+├── clusterer.py              # ForestClusterer (fit, partial_fit, transform, …)
+├── transformer.py            # ForestTransformer (sklearn TransformerMixin)
+├── partitioner.py            # build_iteration_specs, compute_embedding, _cell_ids
+├── feature_encoder.py        # DataEncoder, auto type detection
+├── correlation.py            # Spearman-based feature weighting
+├── correlation_aware.py      # group building & correlation-aware selection
+├── adaptive_bins.py          # per-feature optimal bin counts
+├── kde_cuts.py               # density-aware cut-point generation
+├── distance.py               # pairwise Hamming (exact & chunked)
+├── weighted_distance.py      # weighted Hamming + numba fast paths
+├── iteration_weights.py      # entropy / inverse-gini weighting
+├── sparse_features.py        # weighted one-hot CSR for centroid clusterers
+├── graph_clustering.py       # GraphLouvainClusterer (Louvain & Leiden)
+├── lsh_graph.py              # batched Hamming kNN + LSH banding kNN
+├── contrastive_splits.py     # contrastive tree fitting
+├── permutation_importance.py # feature importance via permutation
+├── preflight.py              # Hopkins, Gap, clusterability_test
+└── significance.py           # ARI permutation, bootstrap CI, silhouette sig
 ```
 
 ```mermaid
 flowchart LR
-    CLI["clusterer.py\nForestClusterer"] --> FE["feature_encoder.py\nDataEncoder"]
-    CLI --> PART["partitioner.py\nbuild_iteration_specs\ncompute_embedding"]
-    CLI --> CORR["correlation.py\ncompute_feature_weights"]
-    CLI --> DIST["distance.py\npairwise_hamming"]
-
+    CLI["clusterer.py"] --> FE["feature_encoder.py"]
+    CLI --> PART["partitioner.py"]
+    CLI --> CORR["correlation.py"]
+    CLI --> DIST["distance.py"]
+    CLI --> GRAPH["graph_clustering.py"]
+    CLI --> LSH["lsh_graph.py"]
+    CLI --> SPARSE["sparse_features.py"]
     FE --> PART
     CORR --> PART
     PART --> DIST
+    PART --> LSH
+    DIST --> GRAPH
+    LSH --> GRAPH
+    SPARSE --> CLI
 ```

@@ -22,7 +22,13 @@ from .significance import (
     cluster_significance,
     apply_multiple_testing_correction,
 )
-from .lsh_graph import batched_hamming_knn, build_sparse_knn_graph
+from .lsh_graph import (
+    batched_hamming_knn,
+    build_sparse_knn_graph,
+    lsh_banding_knn,
+    auto_band_size,
+)
+from .sparse_features import weighted_onehot_features
 from .contrastive_splits import (
     augment_sample,
     generate_pairs,
@@ -31,7 +37,7 @@ from .contrastive_splits import (
     build_contrastive_tree,
 )
 
-__version__ = "0.1.0"
+__version__ = "0.4.0"
 
 __all__ = [
     "ForestClusterer",
@@ -61,6 +67,9 @@ __all__ = [
     "apply_multiple_testing_correction",
     "batched_hamming_knn",
     "build_sparse_knn_graph",
+    "lsh_banding_knn",
+    "auto_band_size",
+    "weighted_onehot_features",
     "augment_sample",
     "generate_pairs",
     "contrastive_loss",

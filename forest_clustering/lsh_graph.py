@@ -166,6 +166,268 @@ def batched_hamming_knn(
     )
 
 
+def _triu_pairs_for_groups(order, sizes, starts):
+    """All within-group ``i<j`` row-id pairs, fully vectorised.
+
+    Group ``g`` occupies ``order[starts[g] : starts[g] + sizes[g]]``.  Pairs are
+    enumerated via the closed-form inverse of the triangular numbering, so there
+    is no Python loop over buckets.
+    """
+    sizes = sizes.astype(np.int64)
+    ppg = sizes * (sizes - 1) // 2                 # pairs per group
+    total = int(ppg.sum())
+    if total == 0:
+        return np.empty(0, np.int64), np.empty(0, np.int64)
+    g = np.repeat(np.arange(len(sizes)), ppg)      # group of each pair
+    base = np.repeat(np.cumsum(ppg) - ppg, ppg)
+    p = np.arange(total) - base                    # 0-based linear index in group
+    sg = sizes[g]
+    s = sg.astype(np.float64)
+    # i = largest int with i*(2s-1-i)/2 <= p  (quadratic inverse, float seed)
+    i = np.floor(((2 * s - 1) - np.sqrt((2 * s - 1) ** 2 - 8 * p)) / 2).astype(np.int64)
+    i = np.clip(i, 0, sg - 2)
+    f = lambda ii: ii * (2 * sg - 1 - ii) // 2
+    i[f(i + 1) <= p] += 1                           # nudge up over float error
+    i[f(i) > p] -= 1                                # nudge down
+    j = (p - f(i)) + i + 1
+    off = starts[g]
+    return order[off + i], order[off + j]
+
+
+def _hamming_pairs(E, lo, hi, chunk=200_000):
+    """Exact column-Hamming distance for row pairs ``(lo, hi)``, chunked."""
+    out = np.empty(lo.shape[0], dtype=np.uint32)
+    for s in range(0, lo.shape[0], chunk):
+        e = min(s + chunk, lo.shape[0])
+        out[s:e] = (E[lo[s:e]] != E[hi[s:e]]).sum(axis=1)
+    return out
+
+
+def _compact_codes(E):
+    """Factorise each column to small contiguous codes for fast equality.
+
+    Equality between rows is preserved, so column-Hamming is identical, but the
+    compact dtype (uint8/uint16/uint32 vs int64 hashes) cuts the memory bandwidth
+    of the pair-distance comparisons several-fold.
+    """
+    n, L = E.shape
+    max_card = 1
+    cols = []
+    for l in range(L):
+        _, inv = np.unique(E[:, l], return_inverse=True)
+        cols.append(inv.ravel())
+        max_card = max(max_card, int(inv.max()) + 1 if inv.size else 1)
+    dtype = np.uint8 if max_card <= 256 else (np.uint16 if max_card <= 65536 else np.uint32)
+    Ec = np.empty((n, L), dtype=dtype)
+    for l in range(L):
+        Ec[:, l] = cols[l]
+    return Ec
+
+
+def auto_band_size(E, k=15, max_bucket=500, target_load=None, min_coverage=0.7,
+                   sample=4096, grid=(2, 3, 4, 6, 8, 10, 12, 16, 20, 24, 32),
+                   random_state=None):
+    """Pick the smallest band size whose collision load is bounded.
+
+    For each candidate band size we estimate, on a random row sample, the mean
+    number of same-bucket mates per row (the "load", which drives cost/memory)
+    and the coverage (fraction of rows that land in a non-degenerate bucket).
+    The smallest band size with ``load <= target_load`` and
+    ``coverage >= min_coverage`` is returned — small bands maximise recall, the
+    load cap keeps cost bounded, and the coverage floor rejects degenerate bands
+    whose buckets are all skipped.
+
+    ``target_load`` defaults to ``8 * k``.
+    """
+    E = np.asarray(E)
+    n, L = E.shape
+    if target_load is None:
+        target_load = 8 * k
+    rng = np.random.default_rng(random_state)
+    idx = rng.choice(n, size=min(sample, n), replace=False) if n > sample else np.arange(n)
+    Es = E[idx]
+
+    best, best_score = grid[-1], None
+    scale = n / len(idx)            # bucket size grows ~linearly with sample size
+    for bs in grid:
+        if bs > L:
+            continue
+        loads, covs = [], []
+        nb = max(1, min(L // bs, 8))
+        for b in range(nb):
+            band = np.ascontiguousarray(Es[:, b * bs:(b + 1) * bs])
+            _, inv, cnt = np.unique(band, axis=0, return_inverse=True,
+                                    return_counts=True)
+            size = cnt[inv.ravel()].astype(np.float64) * scale   # est. full bucket size
+            eff = np.where(size > max_bucket, 1.0, size)         # skipped -> 0 mates
+            loads.append(float((eff - 1).mean()))
+            covs.append(float((eff > 1).mean()))
+        load, cov = float(np.mean(loads)), float(np.mean(covs))
+        if cov >= min_coverage and load <= target_load:
+            return bs
+        score = (cov >= min_coverage, -abs(load - target_load))
+        if best_score is None or score > best_score:
+            best, best_score = bs, score
+    return best
+
+
+def lsh_banding_knn(
+    E: np.ndarray,
+    k: int = 15,
+    band_size=6,
+    n_bands: Optional[int] = None,
+    max_bucket: int = 150,
+    max_candidates_per_row: Optional[int] = None,
+    random_state: Optional[int] = None,
+) -> sparse.coo_matrix:
+    """Sparse kNN graph from a K-ary cell-id embedding via LSH banding.
+
+    The embedding columns are themselves LSH hashes (random-partition cell ids),
+    so two samples that fall in the *same cell across all ``band_size`` columns of
+    at least one band* are candidate neighbours.  Exact column-Hamming distance is
+    computed only for candidate pairs, and the ``k`` nearest are kept per row.
+
+    The implementation is fully vectorised: bucket ids come from
+    ``np.unique(..., axis=0)``, within-bucket pairs from a closed-form triangular
+    inverse (:func:`_triu_pairs_for_groups`), distances in chunks, and per-row
+    top-k from a single lexsort — there is no Python per-row or per-bucket loop.
+    Memory is ``O(n * c)`` (``c`` = candidates per row), never ``O(n^2)``.
+
+    Parameters
+    ----------
+    E : np.ndarray, shape (n, L)
+        Integer cell-id embedding.
+    k : int, default 15
+        Neighbours kept per row.
+    band_size : int or 'auto', default 6
+        Columns per band ``r``.  ``'auto'`` calls :func:`auto_band_size` to pick
+        the smallest band size with bounded collision load.  Smaller ``r`` ->
+        more candidates / higher recall; low-entropy (categorical / few-bin)
+        embeddings collide heavily and need a *larger* ``r``.
+    n_bands : int or None
+        Number of bands ``b``.  ``None`` uses ``L // band_size``.
+    max_bucket : int, default 150
+        Buckets larger than this are skipped (degenerate low-entropy bands).
+    max_candidates_per_row : int or None
+        Cap on candidate pairs incident to a row before distance computation;
+        bounds memory/time to ``O(n * cap)``.  ``None`` -> ``max(64, 8 * k)``.
+    random_state : int or None
+        Permutes the column-to-band assignment (decorrelates bands) and seeds
+        the auto band-size sample / candidate subsampling.
+
+    Returns
+    -------
+    G : scipy.sparse.coo_matrix, shape (n, n)
+        Directed kNN graph with column-Hamming distances — a drop-in replacement
+        for :func:`batched_hamming_knn`.
+    """
+    E = np.asarray(E)
+    if E.ndim != 2:
+        raise ValueError(f"E must be 2D, got {E.ndim}D")
+    if k < 0:
+        raise ValueError(f"k must be >= 0, got {k}")
+
+    n, L = E.shape
+    k_eff = min(k, n - 1)
+    dist_dtype = np.uint16 if L <= 65535 else np.uint32
+
+    if n == 0:
+        return sparse.coo_matrix((0, 0), dtype=dist_dtype)
+    if k_eff == 0:
+        return sparse.coo_matrix((n, n), dtype=dist_dtype)
+
+    if band_size == "auto":
+        band_size = auto_band_size(E, k=k_eff, max_bucket=max_bucket,
+                                   random_state=random_state)
+    if band_size < 1:
+        raise ValueError(f"band_size must be >= 1 or 'auto', got {band_size}")
+
+    if n_bands is None:
+        n_bands = max(1, L // band_size)
+    if max_candidates_per_row is None:
+        max_candidates_per_row = max(64, 16 * k)
+
+    rng_sub = np.random.default_rng(random_state)
+    # Per-band pair cap so the running buffer stays within O(n * cap) memory.
+    per_band_cap = max(n, n * max_candidates_per_row // max(1, n_bands))
+    rng_sub = np.random.default_rng(random_state)
+
+    # Factorise to compact codes once: preserves equality (hence Hamming) while
+    # making bucketing and pair-distance comparisons several-fold cheaper.
+    Ec = _compact_codes(E)
+
+    col_order = np.arange(L)
+    if random_state is not None:
+        col_order = np.random.default_rng(random_state).permutation(L)
+
+    # ── Candidate pairs: vectorised bucketing + triangular pair enumeration ──
+    pair_lo, pair_hi = [], []
+    for b in range(n_bands):
+        band_cols = col_order[b * band_size:(b + 1) * band_size]
+        if band_cols.size == 0:
+            continue
+        band = np.ascontiguousarray(Ec[:, band_cols])
+        # Group rows by identical band tuple with a single sort over a void-typed
+        # key (cheaper than unique(axis=0) followed by a second argsort).
+        vkey = band.view([("", band.dtype)] * band.shape[1]).ravel()
+        order = np.argsort(vkey, kind="stable")
+        vs = vkey[order]
+        bounds = np.flatnonzero(vs[1:] != vs[:-1]) + 1
+        starts = np.concatenate(([0], bounds))
+        sizes = np.concatenate((bounds, [n])) - starts
+        keep = (sizes >= 2) & (sizes <= max_bucket)
+        if not keep.any():
+            continue
+        a, c = _triu_pairs_for_groups(order, sizes[keep], starts[keep])
+        if a.shape[0] > per_band_cap:
+            s = rng_sub.integers(0, a.shape[0], size=per_band_cap)
+            a, c = a[s], c[s]
+        pair_lo.append(np.minimum(a, c))
+        pair_hi.append(np.maximum(a, c))
+
+    if not pair_lo:
+        return sparse.coo_matrix((n, n), dtype=dist_dtype)
+
+    lo = np.concatenate(pair_lo).astype(np.int64)
+    hi = np.concatenate(pair_hi).astype(np.int64)
+    dist = _hamming_pairs(Ec, lo, hi).astype(np.int64)
+
+    # ── Per-row top-k via a single packed-key argsort (cheaper than a 3-key
+    #    lexsort).  Pack (src, dist, dst) into one int64 so sorting orders by
+    #    src, then distance, then dst; duplicate (src,dst) pairs from cross-band
+    #    collisions become adjacent runs and are dropped — no global unique. ──
+    src = np.concatenate([lo, hi])
+    dst = np.concatenate([hi, lo])
+    dd = np.concatenate([dist, dist])
+    id_bits = max(1, int(np.ceil(np.log2(max(n, 2)))))
+    d_bits = max(1, int(np.ceil(np.log2(L + 2))))
+    if 2 * id_bits + d_bits <= 62:
+        packed = (src << (d_bits + id_bits)) | (dd << id_bits) | dst
+        o = np.argsort(packed, kind="stable")
+    else:
+        o = np.lexsort((dst, dd, src))   # very large n: fall back to lexsort
+    src, dst, dd = src[o], dst[o], dd[o]
+    # drop consecutive duplicate (src, dst)
+    dup = np.zeros(src.shape[0], dtype=bool)
+    np.logical_and(src[1:] == src[:-1], dst[1:] == dst[:-1], out=dup[1:])
+    keep0 = ~dup
+    src, dst, dd = src[keep0], dst[keep0], dd[keep0]
+    # rank within each src group (already distance-sorted within group)
+    first = np.empty(src.shape[0], dtype=bool)
+    first[0] = True
+    np.not_equal(src[1:], src[:-1], out=first[1:])
+    grp_start = np.flatnonzero(first)
+    rank = np.arange(src.shape[0]) - np.repeat(grp_start, np.diff(
+        np.concatenate((grp_start, [src.shape[0]]))))
+    sel = rank < k_eff
+
+    return sparse.coo_matrix(
+        (dd[sel].astype(dist_dtype),
+         (src[sel].astype(np.int32), dst[sel].astype(np.int32))),
+        shape=(n, n),
+    )
+
+
 def symmetrize_knn(G: sparse.coo_matrix) -> sparse.coo_matrix:
     """Symmetrize directed kNN graph via element-wise maximum.
 

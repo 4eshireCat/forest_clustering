@@ -11,6 +11,12 @@ from .distance import pairwise_hamming, pairwise_hamming_chunked, cross_hamming
 from .weighted_distance import pairwise_weighted_hamming, weighted_cross_hamming
 
 
+# Below this many samples the graph clusterers use the exact dense distance
+# matrix (cheap at this scale, and reproduces classic tie-breaking exactly);
+# above it they switch to the matrix-free LSH-banding kNN graph.
+_DENSE_GRAPH_MAX_N = 12000
+
+
 def _resolve_n_features(n_features, d: int) -> int:
     if n_features == "sqrt":
         return max(1, int(np.ceil(np.sqrt(d))))
@@ -32,11 +38,21 @@ class ForestClusterer(BaseEstimator, ClusterMixin):
         Features selected per iteration. Float = fraction, "sqrt" = ceil(sqrt(d)).
     n_bins : int
         Number of bins per feature per iteration (K).
-    clusterer : sklearn-compatible estimator or None
-        Downstream clustering algorithm. Must support fit_predict().
-        If metric="precomputed", receives the pairwise distance matrix.
-        If metric="hamming" or not set, receives the (n, L) embedding directly.
-        Default: KMeans(n_clusters=3) when neither clusterer nor n_clusters is specified.
+    clusterer : estimator, str, or None
+        Downstream clustering algorithm.
+
+        - An sklearn-compatible estimator supporting ``fit_predict``.  Centroid
+          estimators (KMeans / MiniBatchKMeans / Birch) cluster on a sparse
+          weighted one-hot feature matrix (no distance matrix).  If
+          ``metric='precomputed'`` it receives the pairwise distance matrix; with
+          ``metric='hamming'`` or unset it receives the ``(n, L)`` embedding.
+        - The string ``'louvain'`` or ``'leiden'`` selects graph community
+          detection on a sparse kNN graph built directly from the embedding
+          (no dense ``O(n^2)`` matrix).  Optional ``':'`` parameters are
+          supported, e.g. ``'leiden:k=20,resolution=1.5'`` (``k`` = neighbours,
+          ``resolution``/``gamma`` = resolution).
+        - Default: ``KMeans(n_clusters=3)`` when neither ``clusterer`` nor
+          ``n_clusters`` is specified.
     corr_threshold : float or None
         Spearman |corr| threshold for grouping correlated features (1/G weighting).
         None disables correlation-based weighting.
@@ -132,6 +148,20 @@ class ForestClusterer(BaseEstimator, ClusterMixin):
     # ------------------------------------------------------------------
 
     def fit(self, X, y=None):
+        """Fit the model: build the random-partition embedding and cluster it.
+
+        Parameters
+        ----------
+        X : array-like of shape (n_samples, n_features)
+            Mixed-type tabular data (numerical and/or categorical).
+        y : ignored
+            Present for scikit-learn API compatibility.
+
+        Returns
+        -------
+        self : ForestClusterer
+            Fitted estimator with ``embedding_`` and ``labels_`` set.
+        """
         rng = np.random.default_rng(self.random_state)
 
         if self.cut_strategy not in ("uniform", "quantile", "kde_peaks"):
@@ -313,6 +343,13 @@ class ForestClusterer(BaseEstimator, ClusterMixin):
         return self
 
     def fit_predict(self, X, y=None) -> np.ndarray:
+        """Fit the model and return cluster labels for ``X``.
+
+        Returns
+        -------
+        labels : ndarray of shape (n_samples,)
+            Integer cluster labels (``-1`` denotes noise where applicable).
+        """
         self.fit(X)
         return self.labels_
 
@@ -602,6 +639,7 @@ class ForestClusterer(BaseEstimator, ClusterMixin):
         return self._embed_encoded(X_enc)
 
     def get_embedding(self) -> np.ndarray:
+        """Return the fitted ``(n_samples, n_iterations)`` cell-id embedding."""
         check_is_fitted(self, "embedding_")
         return self.embedding_
 
@@ -676,7 +714,7 @@ class ForestClusterer(BaseEstimator, ClusterMixin):
         except ValueError:
             return np.nan
 
-    def _embedding_as_weighted_features(self, E: np.ndarray) -> np.ndarray:
+    def _embedding_as_weighted_features(self, E: np.ndarray, sparse_output: bool = False):
         """Map the (n, L) nominal cell-id embedding to weighted one-hot features.
 
         The cell ids produced per iteration are *nominal* labels (their integer
@@ -694,26 +732,33 @@ class ForestClusterer(BaseEstimator, ClusterMixin):
 
         so KMeans/Ward on these features optimise a weighted-Hamming-consistent
         objective and are invariant to relabelling of the cell ids.
-        """
-        E = np.asarray(E)
-        n, L = E.shape
-        w = getattr(self, "iteration_weights_", None)
-        if w is None:
-            w = np.ones(L, dtype=np.float64)
-        w = np.asarray(w, dtype=np.float64)
-        if w.shape[0] != L or not np.isfinite(w).all() or w.sum() <= 0:
-            w = np.ones(L, dtype=np.float64)
-        w = w / w.sum()
 
-        blocks = []
-        for l in range(L):
-            _, inv = np.unique(E[:, l], return_inverse=True)
-            inv = inv.ravel()
-            n_cells = int(inv.max()) + 1 if inv.size else 1
-            oh = np.zeros((n, n_cells), dtype=np.float64)
-            oh[np.arange(n), inv] = np.sqrt(w[l] / 2.0)
-            blocks.append(oh)
-        return np.hstack(blocks) if blocks else np.zeros((n, 0), dtype=np.float64)
+        The matrix has exactly ``L`` non-zeros per row, so it is built as a sparse
+        CSR matrix (``O(n * L)`` memory, independent of per-column cardinality).
+        ``sparse_output=False`` densifies it for estimators that cannot consume
+        sparse input.
+        """
+        from .sparse_features import weighted_onehot_features
+        w = getattr(self, "iteration_weights_", None)
+        return weighted_onehot_features(E, weights=w, sparse_output=sparse_output)
+
+    def _run_graph_clusterer(self, clf, E: np.ndarray):
+        """Run a graph community clusterer, choosing the graph builder by size.
+
+        For ``n <= _DENSE_GRAPH_MAX_N`` the exact dense Hamming distance matrix is
+        used (cheap at this scale and identical to the classic behaviour, with
+        exact tie-breaking); above it the matrix-free LSH-banding kNN graph is
+        used so the dense ``O(n^2)`` matrix is never materialised.
+
+        Returns the fitted ``clf`` (with ``labels_`` set).
+        """
+        n = E.shape[0]
+        if n <= _DENSE_GRAPH_MAX_N:
+            D = self.pairwise_distance().astype(np.float64)
+            clf.fit(D)
+        else:
+            clf.fit_embedding(E)
+        return clf
 
     def _run_clusterer(self, E: np.ndarray) -> np.ndarray:
         clf = self.clusterer
@@ -745,13 +790,21 @@ class ForestClusterer(BaseEstimator, ClusterMixin):
                 hasattr(clf, "_is_louvain_clusterer"):
             E_input = E  # raw cell ids; precomputed/louvain branches recompute D
         else:
-            E_input = self._embedding_as_weighted_features(E)
+            # Centroid estimators (KMeans/MiniBatchKMeans/Birch) consume the
+            # weighted one-hot features.  For large n use a sparse CSR matrix
+            # (O(n*L) memory, no dense blow-up); for small n use the dense
+            # matrix, which is cheap and reproduces the classic results exactly
+            # (sklearn's sparse and dense KMeans code paths differ slightly).
+            from .sparse_features import estimator_supports_sparse
+            use_sparse = estimator_supports_sparse(clf) and E.shape[0] > _DENSE_GRAPH_MAX_N
+            E_input = self._embedding_as_weighted_features(E, sparse_output=use_sparse)
 
         # Handle string shortcuts for graph clustering
         if isinstance(clf, str):
-            if clf == 'louvain' or clf.startswith('louvain:'):
+            if clf in ('louvain', 'leiden') or clf.startswith(('louvain:', 'leiden:')):
                 from .graph_clustering import GraphLouvainClusterer
-                params = {}
+                method = clf.split(':', 1)[0]
+                params = {'community_method': method}
                 if ':' in clf:
                     param_str = clf.split(':', 1)[1]
                     for pair in param_str.split(','):
@@ -765,22 +818,25 @@ class ForestClusterer(BaseEstimator, ClusterMixin):
                             elif k in ('gamma', 'resolution'):
                                 params['resolution'] = float(v)
                             else:
-                                raise ValueError(f"Unknown Louvain parameter: {k!r}. "
+                                raise ValueError(f"Unknown {method} parameter: {k!r}. "
                                                  f"Supported: k, gamma, resolution. "
                                                  f"Got: {clf!r}")
                 self._clusterer_instance = GraphLouvainClusterer(**params, random_state=self.random_state)
-                D = self.pairwise_distance().astype(np.float64)
-                return self._clusterer_instance.fit_predict(D)
+                # Small n: exact dense distance matrix (classic behaviour);
+                # large n: matrix-free LSH-banding kNN graph.
+                return self._run_graph_clusterer(self._clusterer_instance, E).labels_
             else:
                 raise ValueError(f"Unknown clusterer string shortcut: {clf!r}")
 
         # Handle GraphLouvainClusterer or any clusterer that expects
         # a precomputed distance matrix
         if hasattr(clf, 'fit_predict'):
-            # GraphLouvainClusterer works on distance matrices, not embeddings
+            # GraphLouvainClusterer works on a sparse kNN graph built directly
+            # from the embedding — no dense O(n^2) distance matrix.
             if hasattr(clf, '_is_louvain_clusterer'):
-                D = self.pairwise_distance().astype(np.float64)
-                return clf.fit_predict(D)
+                # Small n: exact dense distance matrix (classic behaviour);
+                # large n: matrix-free LSH-banding kNN graph.
+                return self._run_graph_clusterer(clf, E).labels_
             # For other clusterers, check if they want precomputed metric
             metric = getattr(clf, "metric", None)
             if metric == "precomputed":

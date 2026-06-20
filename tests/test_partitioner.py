@@ -54,9 +54,12 @@ def test_cell_ids_in_range():
     K = 4
     specs = build_iteration_specs(1, stats, 3, K, np.ones(3), rng)
     c = _cell_ids(X, specs[0])
-    # max possible cell_id for M=3 features with K=4: K^3 - 1 = 63
+    # Cell ids are non-negative 52-bit collision-resistant hashes (no longer a
+    # positional mixed-radix code), so they are not bounded by K**M.  The only
+    # contract is non-negativity and that there are at most K**M distinct cells
+    # (M=3 features, K=4 bins -> <= 64 distinct ids over the 30 samples).
     assert c.min() >= 0
-    assert c.max() < K**3
+    assert np.unique(c).size <= K ** 3
 
 
 def test_embedding_parallel_matches_sequential():
