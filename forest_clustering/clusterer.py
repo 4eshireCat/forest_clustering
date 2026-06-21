@@ -27,6 +27,22 @@ def _resolve_n_features(n_features, d: int) -> int:
     return max(1, int(n_features))
 
 
+def _resolve_n_bins(n_bins, n: int, d: int, min_bins: int, max_bins: int) -> int:
+    """Resolve fixed/auto n_bins to a validated integer."""
+    if n_bins == "auto":
+        # Simple, stable default: Sturges-style growth with sample size, clipped
+        # by the user-visible min/max range. This gives 2-4 bins on small data,
+        # 5-8 on medium data and avoids over-fragmenting small datasets.
+        raw = int(np.ceil(np.log2(max(n, 2)) + 1))
+        return max(int(min_bins), min(int(max_bins), raw))
+    if isinstance(n_bins, str):
+        raise ValueError("n_bins must be an integer >= 1 or 'auto'")
+    n_bins = int(n_bins)
+    if n_bins < 1:
+        raise ValueError(f"n_bins must be >= 1, got {n_bins}")
+    return n_bins
+
+
 class ForestClusterer(BaseEstimator, ClusterMixin):
     """Clustering via random-partition similarity embeddings.
 
@@ -78,6 +94,9 @@ class ForestClusterer(BaseEstimator, ClusterMixin):
         n_bins: int = 3,
         n_clusters: int | None = None,
         clusterer=None,
+        cluster_input: str = "auto",
+        auto_tune_dbscan: bool = False,
+        dbscan_eps_values=(0.3, 0.2, 0.1),
         corr_threshold: float | None = 0.7,
         corr_sample_size: int = 10_000,
         feature_types: dict | None = None,
@@ -103,20 +122,20 @@ class ForestClusterer(BaseEstimator, ClusterMixin):
         importance_metric: str = 'silhouette',
         auto_feature_types: str = 'naive',  # 'naive' | 'smart'
         contrastive: bool = False,
+        add_missing_indicators: bool = False,
+        rare_category_min_count: int | None = None,
+        rare_category_min_freq: float | None = None,
+        coerce_numeric_strings: bool = False,
+        numeric_string_min_fraction: float = 0.90,
     ):
         self.n_iterations = n_iterations
         self.n_features = n_features
         self.n_bins = n_bins
-        if self.n_bins < 1:
-            raise ValueError(f"n_bins must be >= 1, got {self.n_bins}")
         self.n_clusters = n_clusters
         self.clusterer = clusterer
-        if self.n_clusters is not None and self.clusterer is not None:
-            raise ValueError(
-                f"Both n_clusters={self.n_clusters} and clusterer={self.clusterer!r} "
-                f"were provided. n_clusters is ignored; the explicit clusterer is used. "
-                f"To use n_clusters, set clusterer=None."
-            )
+        self.cluster_input = cluster_input
+        self.auto_tune_dbscan = auto_tune_dbscan
+        self.dbscan_eps_values = dbscan_eps_values
         self.corr_threshold = corr_threshold
         self.corr_sample_size = corr_sample_size
         self.feature_types = feature_types
@@ -142,6 +161,11 @@ class ForestClusterer(BaseEstimator, ClusterMixin):
         self.importance_metric = importance_metric
         self.auto_feature_types = auto_feature_types
         self.contrastive = contrastive
+        self.add_missing_indicators = add_missing_indicators
+        self.rare_category_min_count = rare_category_min_count
+        self.rare_category_min_freq = rare_category_min_freq
+        self.coerce_numeric_strings = coerce_numeric_strings
+        self.numeric_string_min_fraction = numeric_string_min_fraction
 
     # ------------------------------------------------------------------
     # Core sklearn interface
@@ -164,21 +188,51 @@ class ForestClusterer(BaseEstimator, ClusterMixin):
         """
         rng = np.random.default_rng(self.random_state)
 
+        if self.n_clusters is not None and self.clusterer is not None:
+            raise ValueError(
+                f"Both n_clusters={self.n_clusters} and clusterer={self.clusterer!r} "
+                f"were provided. n_clusters is ignored; the explicit clusterer is used. "
+                f"To use n_clusters, set clusterer=None."
+            )
+
         if self.cut_strategy not in ("uniform", "quantile", "kde_peaks"):
             raise ValueError(f"Invalid cut_strategy: {self.cut_strategy!r}")
 
         if self.n_iterations < 1:
             raise ValueError(f"n_iterations must be >= 1, got {self.n_iterations}")
+        if self.cluster_input not in {"auto", "embedding", "onehot", "distance", "similarity"}:
+            raise ValueError("cluster_input must be one of 'auto', 'embedding', 'onehot', 'distance', 'similarity'")
+        if self.min_bins < 1:
+            raise ValueError(f"min_bins must be >= 1, got {self.min_bins}")
+        if self.max_bins < self.min_bins:
+            raise ValueError(f"max_bins ({self.max_bins}) must be >= min_bins ({self.min_bins})")
 
         if self.feature_types is None:
             detected = DataEncoder.detect_feature_types(
-                X, strategy=self.auto_feature_types
+                X,
+                strategy=self.auto_feature_types,
+                coerce_numeric_strings=self.coerce_numeric_strings,
+                numeric_string_min_fraction=self.numeric_string_min_fraction,
             )
-            self.encoder_ = DataEncoder(detected, self.cat_threshold)
+            feature_types = detected
         else:
-            self.encoder_ = DataEncoder(self.feature_types, self.cat_threshold)
+            feature_types = self.feature_types
+        self.encoder_ = DataEncoder(
+            feature_types,
+            self.cat_threshold,
+            add_missing_indicators=self.add_missing_indicators,
+            rare_category_min_count=self.rare_category_min_count,
+            rare_category_min_freq=self.rare_category_min_freq,
+            coerce_numeric_strings=self.coerce_numeric_strings,
+            numeric_string_min_fraction=self.numeric_string_min_fraction,
+        )
         X_enc = self.encoder_.fit_transform(X)
         n, d = X_enc.shape
+        self.n_bins_ = _resolve_n_bins(self.n_bins, n, d, self.min_bins, self.max_bins)
+        if n < 1:
+            raise ValueError("X must contain at least one sample")
+        if d < 1:
+            raise ValueError("X must contain at least one feature")
 
         n_feat = _resolve_n_features(self.n_features, d)
 
@@ -189,6 +243,7 @@ class ForestClusterer(BaseEstimator, ClusterMixin):
                 threshold=self.corr_threshold,
                 sample_size=self.corr_sample_size,
                 rng=rng,
+                feature_types=self.encoder_.feature_types_,
             )
         else:
             self.feature_weights_ = np.ones(d)
@@ -213,7 +268,7 @@ class ForestClusterer(BaseEstimator, ClusterMixin):
             # NEW: Apply categorical bin cap even when adaptive_bins=False
             self.adaptive_bins_map_ = apply_categorical_bin_cap(
                 self.col_stats_,
-                n_bins=self.n_bins,
+                n_bins=self.n_bins_,
                 min_bins=self.min_bins,
                 max_bins=self.max_bins,
                 n=len(X_enc),
@@ -256,7 +311,7 @@ class ForestClusterer(BaseEstimator, ClusterMixin):
             n_iterations=self.n_iterations,
             col_stats=self.col_stats_,
             n_features_per_iter=n_feat,
-            n_bins=self.n_bins,
+            n_bins=self.n_bins_,
             feature_weights=self.feature_weights_,
             rng=rng,
             cut_strategy=self.cut_strategy,
@@ -274,7 +329,7 @@ class ForestClusterer(BaseEstimator, ClusterMixin):
             self.embedding_ = np.zeros((n, self.n_iterations), dtype=np.int64)
             for it in range(self.n_iterations):
                 tree = fit_contrastive_tree(
-                    X_enc, max_depth=max(3, self.n_bins),
+                    X_enc, max_depth=max(3, self.n_bins_),
                     n_pairs=min(20, max(2, n // 2)),
                     temperature=0.5,
                     random_state=(self.random_state + it) if self.random_state is not None else it,
@@ -571,7 +626,7 @@ class ForestClusterer(BaseEstimator, ClusterMixin):
             # NEW: Recompute categorical caps with potentially updated stats
             self.adaptive_bins_map_ = apply_categorical_bin_cap(
                 self.col_stats_,
-                n_bins=self.n_bins,
+                n_bins=self.n_bins_,
                 min_bins=self.min_bins,
                 max_bins=self.max_bins,
                 n=max(n_current, 1),
@@ -582,7 +637,7 @@ class ForestClusterer(BaseEstimator, ClusterMixin):
             n_iterations=self.n_iterations,
             col_stats=self.col_stats_,
             n_features_per_iter=n_feat,
-            n_bins=self.n_bins,
+            n_bins=self.n_bins_,
             feature_weights=self.feature_weights_,
             rng=rng,
             cut_strategy=self.cut_strategy,
@@ -688,6 +743,22 @@ class ForestClusterer(BaseEstimator, ClusterMixin):
             return pairwise_hamming(E_X)
         return pairwise_hamming_chunked(E_X, chunk_size=chunk_size)
 
+
+    def similarity_matrix(
+        self,
+        X=None,
+        Y=None,
+        chunk_size: int = 2_000,
+    ) -> np.ndarray:
+        """Random-partition similarity matrix, defined as ``1 - Hamming``.
+
+        With the fitted partition generator fixed, this estimates the probability
+        that two samples land in the same random cell under the library's
+        partition distribution.
+        """
+        D = self.pairwise_distance(X=X, Y=Y, chunk_size=chunk_size)
+        return (1.0 - D).astype(np.float32, copy=False)
+
     def get_iteration_weights(self):
         """Return the per-iteration weights computed during fit().
 
@@ -763,14 +834,8 @@ class ForestClusterer(BaseEstimator, ClusterMixin):
     def _run_clusterer(self, E: np.ndarray) -> np.ndarray:
         clf = self.clusterer
 
-        # Default clusterer: KMeans on the *weighted one-hot* features.  The raw
-        # cell ids are nominal, so KMeans-on-cell-ids (the previous default) was
-        # not invariant to relabelling and ignored iteration_weighting entirely.
-        # One-hot encoding with per-iteration sqrt(w_l/2) scaling makes squared
-        # Euclidean equal the weighted Hamming distance, so the default is now
-        # relabel-invariant and weight-aware while keeping KMeans' balanced,
-        # well-separated clusters (a precomputed average-linkage default tends to
-        # chain into one giant cluster on the saturated Hamming matrix).
+        # Default clusterer: KMeans on weighted one-hot features. Raw cell ids
+        # are nominal; Euclidean geometry on them is mathematically meaningless.
         if clf is None:
             from sklearn.cluster import KMeans
             n = E.shape[0]
@@ -779,27 +844,12 @@ class ForestClusterer(BaseEstimator, ClusterMixin):
             if k <= 1 or n <= 1:
                 return np.zeros(n, dtype=np.int64)
             clf = KMeans(n_clusters=k, n_init="auto", random_state=self.random_state)
-
-        # Decide how a user-supplied estimator should consume the embedding.
-        #   - "precomputed" / Louvain  -> weighted Hamming distance matrix
-        #   - "hamming"                -> raw cell ids (Hamming is already the
-        #                                 correct nominal metric, relabel-invariant)
-        #   - anything Euclidean (KMeans, Ward, GMM, ...) -> weighted one-hot
-        metric = getattr(clf, "metric", None) if not isinstance(clf, str) else None
-        if isinstance(clf, str) or metric in ("precomputed", "hamming") or \
-                hasattr(clf, "_is_louvain_clusterer"):
-            E_input = E  # raw cell ids; precomputed/louvain branches recompute D
+            forced_mode = "onehot"
         else:
-            # Centroid estimators (KMeans/MiniBatchKMeans/Birch) consume the
-            # weighted one-hot features.  For large n use a sparse CSR matrix
-            # (O(n*L) memory, no dense blow-up); for small n use the dense
-            # matrix, which is cheap and reproduces the classic results exactly
-            # (sklearn's sparse and dense KMeans code paths differ slightly).
-            from .sparse_features import estimator_supports_sparse
-            use_sparse = estimator_supports_sparse(clf) and E.shape[0] > _DENSE_GRAPH_MAX_N
-            E_input = self._embedding_as_weighted_features(E, sparse_output=use_sparse)
+            forced_mode = self.cluster_input
 
-        # Handle string shortcuts for graph clustering
+        # String shortcuts are graph clusterers and consume the embedding through
+        # a graph builder, not a dense feature/similarity matrix.
         if isinstance(clf, str):
             if clf in ('louvain', 'leiden') or clf.startswith(('louvain:', 'leiden:')):
                 from .graph_clustering import GraphLouvainClusterer
@@ -818,45 +868,65 @@ class ForestClusterer(BaseEstimator, ClusterMixin):
                             elif k in ('gamma', 'resolution'):
                                 params['resolution'] = float(v)
                             else:
-                                raise ValueError(f"Unknown {method} parameter: {k!r}. "
-                                                 f"Supported: k, gamma, resolution. "
-                                                 f"Got: {clf!r}")
+                                raise ValueError(
+                                    f"Unknown {method} parameter: {k!r}. Supported: k, gamma, resolution. Got: {clf!r}"
+                                )
                 self._clusterer_instance = GraphLouvainClusterer(**params, random_state=self.random_state)
-                # Small n: exact dense distance matrix (classic behaviour);
-                # large n: matrix-free LSH-banding kNN graph.
                 return self._run_graph_clusterer(self._clusterer_instance, E).labels_
-            else:
-                raise ValueError(f"Unknown clusterer string shortcut: {clf!r}")
+            raise ValueError(f"Unknown clusterer string shortcut: {clf!r}")
 
-        # Handle GraphLouvainClusterer or any clusterer that expects
-        # a precomputed distance matrix
-        if hasattr(clf, 'fit_predict'):
-            # GraphLouvainClusterer works on a sparse kNN graph built directly
-            # from the embedding — no dense O(n^2) distance matrix.
-            if hasattr(clf, '_is_louvain_clusterer'):
-                # Small n: exact dense distance matrix (classic behaviour);
-                # large n: matrix-free LSH-banding kNN graph.
-                return self._run_graph_clusterer(clf, E).labels_
-            # For other clusterers, check if they want precomputed metric
+        if hasattr(clf, '_is_louvain_clusterer'):
+            return self._run_graph_clusterer(clf, E).labels_
+
+        mode = forced_mode
+        if mode == "auto":
             metric = getattr(clf, "metric", None)
-            if metric == "precomputed":
-                D = self.pairwise_distance().astype(np.float64)
-                return clf.fit_predict(D)
-            # Otherwise pass embedding directly
-            labels = clf.fit_predict(E_input)
+            affinity = getattr(clf, "affinity", None)
+            if type(clf).__name__ == "SpectralClustering" and affinity == "precomputed":
+                mode = "similarity"
+            elif metric == "precomputed" or affinity == "precomputed":
+                mode = "distance"
+            elif metric == "hamming":
+                mode = "embedding"
+            else:
+                mode = "onehot"
+
+        if mode == "distance":
+            X_input = self.pairwise_distance().astype(np.float64)
+            np.fill_diagonal(X_input, 0.0)
+        elif mode == "similarity":
+            X_input = self.similarity_matrix().astype(np.float64)
+            np.fill_diagonal(X_input, 1.0)
+        elif mode == "embedding":
+            X_input = E
+        elif mode == "onehot":
+            from .sparse_features import estimator_supports_sparse
+            use_sparse = estimator_supports_sparse(clf) and E.shape[0] > _DENSE_GRAPH_MAX_N
+            X_input = self._embedding_as_weighted_features(E, sparse_output=use_sparse)
+        else:
+            raise ValueError("cluster_input must be one of 'auto', 'embedding', 'onehot', 'distance', 'similarity'")
+
+        if hasattr(clf, 'fit_predict'):
+            labels = clf.fit_predict(X_input)
         elif hasattr(clf, 'fit'):
-            clf.fit(E_input)
+            clf.fit(X_input)
             labels = clf.labels_
         else:
             raise ValueError(f"clusterer must have fit_predict or fit method, got {type(clf).__name__}")
 
-        # If DBSCAN finds only 1 cluster, try smaller eps values.
-        # Retry on the raw cell ids with Hamming, the correct nominal metric.
+        # Historical behaviour silently retried DBSCAN with smaller eps values
+        # whenever <=1 cluster was found. That changes user-specified DBSCAN
+        # semantics. It is now opt-in only.
         n_clusters = len(set(labels)) - (1 if -1 in labels else 0)
-        if n_clusters <= 1 and isinstance(clf, DBSCAN):
-            for eps in [0.3, 0.2, 0.1]:
-                clf_retry = DBSCAN(metric="hamming", eps=eps, n_jobs=self.n_jobs)
-                labels = clf_retry.fit_predict(E)
+        if self.auto_tune_dbscan and n_clusters <= 1 and isinstance(clf, DBSCAN):
+            retry_mode = "embedding" if getattr(clf, "metric", None) == "hamming" else mode
+            for eps in self.dbscan_eps_values:
+                if getattr(clf, "metric", None) == "precomputed" or retry_mode == "distance":
+                    retry = DBSCAN(metric="precomputed", eps=eps, n_jobs=self.n_jobs)
+                    labels = retry.fit_predict(self.pairwise_distance().astype(np.float64))
+                else:
+                    retry = DBSCAN(metric="hamming", eps=eps, n_jobs=self.n_jobs)
+                    labels = retry.fit_predict(E)
                 n_clusters = len(set(labels)) - (1 if -1 in labels else 0)
                 if n_clusters >= 2:
                     break

@@ -1,81 +1,117 @@
 # Changelog
 
-## 0.4.0 — Leiden backend, API/docstring audit, small-`n` parity
+## 0.8.0 - prototype sampling and subsampled clustering
 
-### Added
-- **Leiden community detection** (`leidenalg` + `igraph`) as an alternative to
-  Louvain: `GraphLouvainClusterer(community_method='leiden')` and the
-  `ForestClusterer` string shortcuts `clusterer='leiden'` /
-  `'leiden:k=20,resolution=1.5'`. Installs via the optional `leiden` extra
-  (`pip install forest-clustering[leiden]`).
-- `auto_band_size` is now exported from the package root.
+- Added `PrototypeSampler` with `leaf_signature` and `birch` modes.
+- Added weighted prototypes, `inverse_assignment_`, `expand_labels()` and compression diagnostics.
+- Added `SubsampledClusterer` wrapper to fit expensive clustering on prototypes and return full-data labels.
+- Added visualization helpers for compression, prototype weights and reconstruction error.
+- Added tests for prototype weights, label expansion, rare-bucket preservation, BIRCH mode and full-data label expansion.
 
-### Changed
-- **Graph clusterers are size-aware.** For `n <= 12000` the Louvain/Leiden route
-  uses the exact dense Hamming distance matrix (cheap at this scale and
-  identical to the classic behaviour, including tie-breaking); above it the
-  matrix-free LSH-banding kNN graph is used. This guarantees small-dataset
-  results are unchanged from earlier versions while keeping large-`n` scalable.
-- `networkx` is now imported lazily (only when `community_method='louvain'`), so
-  a Leiden-only install does not require it. Declared as the optional `graph`
-  extra.
-- Docstring/API audit: rewrote `GraphLouvainClusterer`'s docstring, documented
-  the `clusterer` string shortcuts on `ForestClusterer`, and filled previously
-  missing public docstrings (`fit`, `fit_predict`, `get_embedding`).
 
-- For `n <= 12000` the centroid clusterers also use the dense weighted one-hot
-  (sparse CSR only above the threshold), so small-data KMeans results are exact
-  too.
-
-### Validation
-- Regression-checked against the pre-refactor version on small samples (1500
-  rows) of Adult, Nursery, Car, Mushroom and Tic-tac-toe: **bit-for-bit identical
-  ARI/NMI on all five for both the KMeans and Louvain paths.**
-
-## 0.3.0 — Scalable large-`n` paths (no dense distance matrix)
-
-The dense `n x n` distance matrix is no longer on the critical path for the
-common large-`n` algorithms; it remains available as a small-`n` convenience and
-for genuinely `precomputed`-only estimators.
-
-### Added
-- **Sparse weighted one-hot features** (`forest_clustering.sparse_features`,
-  `weighted_onehot_features`). The cell-id embedding is encoded as a sparse CSR
-  matrix with exactly `L` non-zeros per row (`O(n*L)` memory, independent of
-  per-column cardinality), where squared Euclidean distance equals the weighted
-  Hamming distance. Centroid estimators (KMeans / MiniBatchKMeans / Birch) now
-  cluster directly on this representation. This also removes the dense one-hot
-  out-of-memory failure in the default KMeans path.
-- **LSH banding kNN graph** (`forest_clustering.lsh_graph.lsh_banding_knn`) — a
-  fully vectorised, sub-quadratic, drop-in replacement for
-  `batched_hamming_knn`. Candidate neighbours come from shared per-band cell-id
-  tuples; exact Hamming is computed only on candidates. Memory is `O(n*c)`,
-  never `O(n^2)`, and independent of per-column cardinality.
-- **`auto_band_size`** and `band_size='auto'`: picks the smallest band size that
-  keeps the bucket-collision load bounded, adapting to data entropy.
-- `GraphLouvainClusterer.fit_embedding(..., method='auto'|'knn'|'banding')`
-  builds its graph straight from the embedding; `'auto'` switches to banding
-  above `banding_threshold` rows.
-- `networkx` declared as the optional `graph` extra
-  (`pip install forest-clustering[graph]`).
-
-### Changed
-- `ForestClusterer` Louvain paths build a sparse kNN graph from the embedding
-  instead of a dense distance matrix.
-- Banding internals are fully vectorised (compact-code factorisation,
-  triangular-inverse pair enumeration, single packed-key top-k) — roughly 3x
-  faster graph construction with bounded memory.
+## 0.6.1 - AutoTree scoring leakage fix
 
 ### Fixed
-- `GraphLouvainClusterer._run_louvain_on_knn` cast kNN distances to float before
-  the similarity transform, fixing an unsigned-integer overflow that turned
-  `exp(-d^2/...)` into `inf` and crashed Louvain.
-- Updated a stale partitioner test that assumed the obsolete positional
-  `K**M` cell-id bound (cell ids are 52-bit hashes).
 
-### Validation (UCI Adult, 48,842 rows)
-- Centroid: old dense one-hot needs ~7 GB and fails; sparse CSR clusters all
-  rows in ~2 s at ~430 MB (60x smaller features).
-- Graph: old exact-kNN needs ~9.8 GB and fails; LSH banding builds in ~7 s at
-  ~1.1 GB with kNN recall@15 ≈ 0.94 and exact-vs-banding label agreement
-  ARI ≈ 0.89.
+- Fixed a model-selection bug in `AutoTreeClusterer`: silhouette scoring no longer uses estimator distances that may be derived directly from final cluster labels.
+- `UnsupervisedBinaryTreeClusterer` is now scored in its fitted preprocessed feature space during AutoTree search, preventing self-confirming distance scores where every non-trivial leaf partition looked perfect.
+- Added robust secondary tie-breakers for AutoTree candidate ranking: silhouette, stability, Calinski-Harabasz, negative Davies-Bouldin, then `n_clusters`.
+- Added regression tests showing that AutoTree now selects `k=3` on a three-blob dataset where version 0.6.0 selected `k=2`.
+
+### Added
+
+- `scoring_space` parameter for `AutoTreeClusterer`: `"auto"` / `"features"` use leak-safe feature scoring; `"proximity"` is an explicit compatibility mode.
+- `scoring_sample_size` parameter for optional silhouette subsampling on larger datasets.
+
+## 0.6.0 - Automatic parameter selection
+
+- Added `AutoTreeClusterer`, a sklearn-style meta-estimator for automatic selection over algorithm families, cluster counts, parameter grids and random restarts.
+- Added internal scoring modes: `silhouette`, `calinski_harabasz`, `davies_bouldin`, `stability`, and `combined`.
+- Added `best_estimator_`, `best_algorithm_`, `best_n_clusters_`, `best_score_`, `best_params_`, `cv_results_`, and `search_results_`.
+- Delegated `transform`, `similarity_matrix`, `proximity_matrix`, and `pairwise_distance` from `AutoTreeClusterer` to the selected estimator.
+- Added TDD tests for model selection, matrix delegation, stability scoring, sklearn cloneability, reproducibility and validation errors.
+
+## 0.5.1 - Quality fixes
+
+- Made DBSCAN eps retry opt-in via `auto_tune_dbscan=False` default.
+- Added explicit `cluster_input={"auto", "embedding", "onehot", "distance", "similarity"}` to avoid ambiguous downstream-clusterer inputs.
+- Added missing-value indicator features through `add_missing_indicators`.
+- Added rare-category grouping via `rare_category_min_count` and `rare_category_min_freq`.
+- Added numeric-string coercion via `coerce_numeric_strings` and `numeric_string_min_fraction`.
+- Added `n_bins="auto"` for simple Sturges-style bin selection.
+- Propagated quality preprocessing options to URF, ExtraTrees proximity and binary tree estimators.
+- Added regression tests for these fixes.
+
+
+## 0.5.0
+
+Release-preparation version consolidating the patched fork into a deployable package.
+
+### Added
+
+- `UnsupervisedRandomForestClusterer`: Breiman-style unsupervised random forest clustering.
+- `ExtraTreesProximityClusterer`: ExtraTrees-based proximity clustering.
+- `UnsupervisedBinaryTreeClusterer`: interpretable greedy binary tree clustering.
+- `transform_onehot(X)` for URF and ExtraTrees.
+- Shared tree utilities in `_tree_common.py`.
+- Expanded tests for proximity semantics, sklearn API compatibility, missing values, Titanic smoke checks, and downstream clustering behavior.
+- `README.md`, `ALGORITHM.md`, `RELEASE.md`, `MANIFEST.in`, and deployment metadata.
+
+### Fixed
+
+- Corrected quantile cut-point sampling in `ForestClusterer`.
+- Avoided Spearman correlation weighting for arbitrary label-encoded categoricals.
+- Added explicit `similarity_matrix()` API.
+- Moved heavy estimator validation out of `__init__` and into `fit()`.
+- Fixed downstream clustering for tree estimators: non-precomputed clusterers now receive sparse one-hot leaf features rather than raw leaf ids.
+- Improved robustness on all-missing mixed columns.
+- Added compatibility helpers for sklearn API differences around `OneHotEncoder` and `SimpleImputer`.
+
+### Notes
+
+This version keeps the public API sklearn-like and intentionally does not upload credentials or tokens. Build and upload commands are documented in `RELEASE.md`.
+
+## 0.7.0 - cluster-label assignment and explanations
+
+Added an inductive explanation layer on top of tree-based clustering:
+
+- `ClusterLabelClassifier` learns a supervised classifier that reproduces cluster labels.
+  It provides `predict`, `predict_proba`, out-of-fold fidelity metrics, confidence-based rejection,
+  cluster profiles and diagnostic plots.
+- `ClusterSurrogateTree` fits an interpretable decision tree to cluster labels and exports
+  human-readable rules, rule tables and tree visualizations.
+- New plotting helpers:
+  - `plot_cluster_sizes()`
+  - `plot_embedding()`
+  - `plot_feature_importances()`
+  - `plot_fidelity_confusion_matrix()`
+  - `ClusterSurrogateTree.plot_tree()`
+- New explanation helpers:
+  - `cluster_profile()`
+  - `explain_clusters()`
+  - `explain_rules()`
+  - `rules_dataframe()`
+- Added regression tests for inductive assignment, rule extraction, confidence rejection and plotting.
+
+Important terminology: fidelity metrics measure how well the supervised surrogate reproduces
+cluster labels. They do not prove that the original clustering is externally correct.
+
+## 0.9.0 - Diagnostics and visualisation
+
+Added:
+
+- `ClusterDiagnosticsReport` for clustering diagnostics, health checks, cluster cards and plots.
+- `StabilityAnalyzer` for seed/resampling stability analysis using ARI/NMI.
+- `compare_clusterings()` and `ClusterComparison` for model comparison tables and agreement heatmaps.
+- AutoTree visualisation helpers: `plot_search_results()`, `plot_k_selection()` and `plot_parameter_sensitivity()`.
+- Diagnostic visualisations: cluster sizes, PCA/SVD embeddings, silhouette plots, profile plots, proximity heatmaps and uncertainty histograms.
+- Mixed-data fallback in `compare_clusterings()` for ordinary sklearn baselines such as `KMeans`.
+
+Changed:
+
+- Bumped package version to `0.9.0`.
+- Documentation now presents diagnostics as a first-class workflow: fit -> diagnose -> explain -> compare -> deploy.
+
+Notes:
+
+- Diagnostic metrics are internal validity/stability signals. They help catch failure modes, but they do not prove that a clustering is the only correct segmentation.

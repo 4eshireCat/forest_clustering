@@ -5,7 +5,7 @@ import pandas as pd
 from sklearn.base import BaseEstimator, TransformerMixin
 from sklearn.utils.validation import check_is_fitted
 
-from .clusterer import _resolve_n_features
+from .clusterer import _resolve_n_features, _resolve_n_bins
 from .feature_encoder import DataEncoder
 from .correlation import compute_feature_weights
 from .partitioner import build_col_stats, build_iteration_specs, compute_embedding
@@ -56,6 +56,11 @@ class ForestTransformer(BaseEstimator, TransformerMixin):
         random_state: int | None = None,
         iteration_weighting: str = "uniform",
         weight_temperature: float = 1.0,
+        add_missing_indicators: bool = False,
+        rare_category_min_count: int | None = None,
+        rare_category_min_freq: float | None = None,
+        coerce_numeric_strings: bool = False,
+        numeric_string_min_fraction: float = 0.90,
     ):
         self.n_iterations = n_iterations
         self.n_features = n_features
@@ -71,6 +76,11 @@ class ForestTransformer(BaseEstimator, TransformerMixin):
         self.random_state = random_state
         self.iteration_weighting = iteration_weighting
         self.weight_temperature = weight_temperature
+        self.add_missing_indicators = add_missing_indicators
+        self.rare_category_min_count = rare_category_min_count
+        self.rare_category_min_freq = rare_category_min_freq
+        self.coerce_numeric_strings = coerce_numeric_strings
+        self.numeric_string_min_fraction = numeric_string_min_fraction
 
     def fit(self, X, y=None):
         """Fit the transformer: encode data, build specs, compute embedding.
@@ -94,9 +104,19 @@ class ForestTransformer(BaseEstimator, TransformerMixin):
         self.encoder_ = DataEncoder(
             feature_types_override=self.feature_types,
             cat_threshold=self.cat_threshold,
+            add_missing_indicators=self.add_missing_indicators,
+            rare_category_min_count=self.rare_category_min_count,
+            rare_category_min_freq=self.rare_category_min_freq,
+            coerce_numeric_strings=self.coerce_numeric_strings,
+            numeric_string_min_fraction=self.numeric_string_min_fraction,
         )
         X_enc = self.encoder_.fit_transform(X)
         n, d = X_enc.shape
+        if n < 1:
+            raise ValueError("X must contain at least one sample")
+        if d < 1:
+            raise ValueError("X must contain at least one feature")
+        self.n_bins_ = _resolve_n_bins(self.n_bins, n, d, 2, max(10, int(self.n_bins) if isinstance(self.n_bins, int) else 10))
 
         n_feat = _resolve_n_features(self.n_features, d)
 
@@ -126,7 +146,7 @@ class ForestTransformer(BaseEstimator, TransformerMixin):
             n_iterations=self.n_iterations,
             col_stats=self.col_stats_,
             n_features_per_iter=n_feat,
-            n_bins=self.n_bins,
+            n_bins=self.n_bins_,
             feature_weights=self.feature_weights_,
             rng=rng,
             cut_strategy=self.cut_strategy,

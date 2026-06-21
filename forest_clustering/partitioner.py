@@ -50,8 +50,17 @@ def build_col_stats(
             q75 = float(np.percentile(finite, 75)) if len(finite) else 0.0
             std = float(np.std(finite)) if len(finite) else 0.0
             if (quantile_cuts or cut_strategy == "quantile") and len(finite) > 1:
+                # Store a sorted empirical sample and draw random probabilities at
+                # spec-construction time.  The previous implementation sampled raw
+                # observed values and later re-sampled from those points; that is a
+                # bootstrap of values, not random empirical quantiles, and it
+                # over-represented duplicate-heavy / high-density regions.
                 k = min(quantile_sample, len(finite))
-                qpts = np.sort(rng.choice(finite, size=k, replace=False))
+                if k < len(finite):
+                    q_sample = rng.choice(finite, size=k, replace=False)
+                else:
+                    q_sample = finite
+                qpts = np.sort(np.asarray(q_sample, dtype=np.float64))
                 stats.append({"type": "numerical", "quantile_pts": qpts, "min": lo, "max": hi, "n_unique": n_unique, "q25": q25, "q75": q75, "std": std})
             else:
                 stats.append({"type": "numerical", "min": lo, "max": hi, "n_unique": n_unique, "q25": q25, "q75": q75, "std": std})
@@ -141,11 +150,16 @@ def _make_num_edges(s: dict, K: int, rng: np.random.Generator, cut_strategy: str
         cuts, _ = kde_peaks_cut_points(col_data, n_edges, rng, kde_params)
         return np.sort(cuts)
     if "quantile_pts" in s:
-        pts = s["quantile_pts"]
-        if len(pts) <= n_edges:
-            return pts
-        chosen = rng.choice(pts, size=n_edges, replace=False)
-        return np.sort(chosen)
+        pts = np.asarray(s["quantile_pts"], dtype=np.float64)
+        if len(pts) == 0:
+            return np.array([], dtype=np.float64)
+        if pts[0] == pts[-1]:
+            return np.full(n_edges, pts[0], dtype=np.float64)
+        # True random empirical quantile cuts: draw probabilities uniformly on
+        # (0, 1), then interpolate against the sorted empirical sample.
+        probs = rng.uniform(0.0, 1.0, size=n_edges)
+        chosen = np.quantile(pts, probs, method="linear")
+        return np.sort(np.asarray(chosen, dtype=np.float64))
     lo, hi = s["min"], s["max"]
     if lo == hi:
         return np.full(n_edges, lo)

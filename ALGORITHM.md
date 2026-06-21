@@ -1,393 +1,350 @@
-# ForestClustering: Algorithm & Architecture
+# Algorithms
 
-> Document version matches `forest_clustering` **0.4.0**.
+This document explains the algorithms implemented by `forest-clustering`, their mathematical interpretation, and the main implementation choices.
 
----
+## 1. Random-partition clustering: `ForestClusterer`
 
-## Contents
+`ForestClusterer` is a random-partition similarity method. It does not train supervised decision trees. Instead, it repeatedly samples a small subset of features, partitions each selected feature into bins, and encodes every row by the cell it falls into.
 
-1. [Architecture overview](#1-architecture-overview)
-2. [Step 1 — Feature Encoding](#2-step-1--feature-encoding)
-3. [Step 2 — Random Partitioning & Embedding](#3-step-2--random-partitioning--embedding)
-   - [One iteration](#31-one-iteration)
-   - [Cell-ID hashing](#32-cell-id-hashing)
-   - [The n×L embedding matrix](#33-the-nl-embedding-matrix)
-   - [Cut-point strategies](#34-cut-point-strategies)
-4. [Step 3 — Distance & Similarity](#4-step-3--distance--similarity)
-5. [Step 4 — Downstream Clustering](#5-step-4--downstream-clustering)
-6. [Advanced mechanisms](#6-advanced-mechanisms)
-   - [Adaptive bins](#61-adaptive-bins)
-   - [Correlation-aware selection](#62-correlation-aware-selection)
-   - [Iteration weighting](#63-iteration-weighting)
-   - [Contrastive trees](#64-contrastive-trees)
-   - [LSH-banding kNN graph](#65-lsh-banding-knn-graph)
-7. [Online / incremental mode](#7-online--incremental-mode)
-8. [Code map](#8-code-map)
+For iteration `l`:
 
----
+1. Select `m` features from `p` input columns.
+2. For every selected numerical feature, draw `K - 1` cut points.
+3. For categorical features, group categories into bins.
+4. Assign each row to a mixed-radix cell id.
 
-## 1. Architecture overview
+After `L` iterations, the embedding is an integer matrix:
 
-```mermaid
-flowchart TD
-    A["Input X<br/>DataFrame or ndarray<br/>mixed types"] --> B["Step 1: DataEncoder<br/>auto-detect types<br/>label-encode categorical<br/>→ float64 matrix X_enc"]
-
-    B --> C["Step 2: Partitioning Engine<br/>L independent iterations<br/>parallel (joblib)"]
-
-    C --> C1["Iteration 1<br/>select m features<br/>draw cuts → cell IDs"]
-    C --> C2["Iteration 2<br/>..."]
-    C --> C3["Iteration L<br/>..."]
-
-    C1 & C2 & C3 --> D["Embedding E<br/>n × L int64<br/>E[i,l] = cell_id"]
-
-    D --> E1["Step 3a: Hamming distance<br/>D[i,j] = fraction of differing cells<br/>∈ [0,1], float32"]
-    D --> E2["Step 3b: Weighted one-hot<br/>sparse CSR φ<br/>||φ_i−φ_j||² = weighted Hamming"]
-    D --> E3["Step 3c: LSH-banding kNN<br/>sparse graph G<br/>for Louvain / Leiden"]
-
-    E1 --> F["Step 4: Downstream clusterer<br/>KMeans / AgglClust / DBSCAN / Louvain / Leiden<br/>→ labels"]
-    E2 --> F
-    E3 --> F
+```text
+E in N^(n x L)
 ```
 
-**Key invariant:** the dense `n × n` distance matrix is **never materialised** for large `n`. The `n × L` embedding (`L ≈ 200`) is the only compact representation kept in memory.
+where `E[i, l]` is the random cell id of sample `i` at iteration `l`.
 
----
+The default dissimilarity is Hamming distance over random partition ids:
 
-## 2. Step 1 — Feature Encoding
-
-`DataEncoder` (`feature_encoder.py`) inspects each column and decides whether it is **numerical** or **categorical**.
-
-```mermaid
-flowchart LR
-    A["Column X_j"] --> B{{"Type?"}}
-    B -->|"object / category / bool"| C["Categorical"]
-    B -->|"int/float, n_unique ≤ cat_threshold"| C
-    B -->|"int/float, n_unique > cat_threshold"| D["Numerical"]
-    C --> C1["LabelEncoder<br/>known → 0..U-1<br/>NaN / unknown → -1"]
-    D --> D1["Pass through as float64"]
-    C1 & D1 --> E["X_enc<br/>n × d float64"]
+```text
+D(i, j) = (1 / L) * sum_l 1[E[i, l] != E[j, l]]
+S(i, j) = 1 - D(i, j)
 ```
 
-| Behaviour | Numerical | Categorical |
-|---|---|---|
-| `fit_transform` | values preserved | label-encoded to `0 … U-1` |
-| `transform` (new data) | values preserved | unknown category → `-1` |
-| NaN | preserved as NaN | mapped to `-1` |
-| Override | `feature_types={col: "numerical"}` | `feature_types={col: "categorical"}` |
+`S(i, j)` estimates how often two samples co-occur in the same random partition cell under the package's partition generator. It should be interpreted as a random-partition similarity, not as a universal ground-truth similarity.
 
-**Smart auto-detection** (`auto_feature_types='smart'`):
-* datetime → numerical (timestamp)
-* integer with ID-like name (`_id`, `user_id`, …) and high cardinality → numerical
-* low-cardinality integer → categorical
-* float values that are actually integers (`1.0, 2.0`) → categorical if cardinality is low
+### Numerical cut strategies
 
----
+- `cut_strategy="uniform"`: cut points are sampled uniformly inside the observed feature range.
+- `cut_strategy="quantile"` or `quantile_cuts=True`: cut points are sampled by drawing quantile probabilities uniformly and applying empirical quantiles. This is robust to heavy-tailed features and outliers.
+- KDE helpers can be used to choose density-aware cut points.
 
-## 3. Step 2 — Random Partitioning & Embedding
+### Correlation handling
 
-### 3.1 One iteration
+Highly correlated features can make random partitions over-count one latent direction. `ForestClusterer` can down-weight correlated numerical feature groups. Label-encoded categorical features are intentionally excluded from Spearman-based weighting, because arbitrary category codes do not define an ordinal scale.
 
-Each of the `L` iterations is independent.
+### Downstream clustering
 
-```mermaid
-flowchart TD
-    A["X_enc<br/>n × d"] --> B["Select m features<br/>Gumbel-max trick<br/>weighted without replacement"]
-    B --> C["For each selected feature f"]
-    C --> D{{"Type of f?"}}
-    D -->|"Numerical"| E["Draw K−1 cut-points<br/>uniform / quantile / KDE peaks"]
-    D -->|"Categorical"| F["Shuffle categories<br/>round-robin into K bins"]
-    E --> G["bin_f(x) = searchsorted(edges, x)<br/>∈ {0,…,K-1}<br/>NaN → bin 0"]
-    F --> H["bin_f(x) = cat_map[x]<br/>unknown → K-1"]
-    G & H --> I["Hash-combine per-feature bins<br/>→ cell_id (int64)"]
-    I --> J["E[:, l] = cell_ids"]
+The embedding can be consumed by any sklearn-compatible clusterer. Common choices:
+
+- `KMeans` / `MiniBatchKMeans` on the embedding or weighted one-hot features.
+- `AgglomerativeClustering(metric="precomputed")` on pairwise Hamming distance.
+- `DBSCAN(metric="precomputed")` or HDBSCAN-style algorithms on distance matrices.
+- Graph clustering after building a sparse nearest-neighbor graph from Hamming distances.
+
+## 2. Breiman-style unsupervised random forest: `UnsupervisedRandomForestClusterer`
+
+This estimator implements the classic unsupervised random-forest trick:
+
+1. Build a synthetic null dataset `X_synth` with the same number of rows as `X`.
+2. Label real rows as `1` and synthetic rows as `0`.
+3. Train a `RandomForestClassifier` to discriminate real data from null data.
+4. Transform real rows into forest leaf ids.
+5. Define proximity as the fraction of trees where two rows land in the same leaf.
+
+For trees `t = 1, ..., T` and leaf ids `L_t(i)`:
+
+```text
+P(i, j) = (1 / T) * sum_t 1[L_t(i) = L_t(j)]
+D(i, j) = 1 - P(i, j)
 ```
 
-**Feature selection.** `m` is controlled by `n_features`:
-* `"sqrt"` → `ceil(sqrt(d))`
-* `"log2"` → `ceil(log2(d))`
-* `int` → fixed count
-* `float` → fraction of `d`
+The proximity is high when the forest repeatedly considers two rows similar under splits that separate real joint structure from synthetic noise.
 
-The **Gumbel-max trick** implements weighted sampling without replacement in `O(d)`:
+### Synthetic null modes
 
+- `synthetic="permute_marginals"`: independently permutes each column. This preserves one-dimensional marginal distributions but breaks cross-feature dependence.
+- `synthetic="uniform_box"`: samples numerical columns uniformly from their observed range and categorical columns from observed categories. This is a stronger null and can be useful when marginal preservation is not desired.
+
+### Downstream clustering safety
+
+Raw leaf ids are nominal labels. Their numeric values are arbitrary. Therefore:
+
+- clusterers with `metric="precomputed"` receive `1 - proximity`;
+- other clusterers receive a sparse one-hot leaf embedding from `transform_onehot(X)`.
+
+This avoids invalid Euclidean geometry over raw leaf numbers.
+
+## 3. ExtraTrees proximity clustering: `ExtraTreesProximityClusterer`
+
+`ExtraTreesProximityClusterer` uses the same synthetic-null procedure as URF, but trains an `ExtraTreesClassifier` instead of a standard random forest.
+
+The proximity definition is the same:
+
+```text
+P(i, j) = fraction of ExtraTrees where i and j share a leaf
 ```
-score_j = log(weight_j) + Gumbel(0,1)
-select top-m scores
+
+Compared with URF, ExtraTrees usually produces more randomized split boundaries. This can be faster and can reduce variance in some high-dimensional settings, but it can also be noisier when the synthetic discrimination task is weak.
+
+Use it as a companion baseline to URF rather than a strict replacement.
+
+## 4. Greedy unsupervised binary tree: `UnsupervisedBinaryTreeClusterer`
+
+This estimator builds a single interpretable clustering tree.
+
+At each step, it considers candidate binary splits and chooses the split with the largest reduction in within-node squared error. It recursively splits until it reaches the requested number of leaves/clusters or the stopping constraints.
+
+For a node containing rows `A`, define within-node SSE:
+
+```text
+SSE(A) = sum_{i in A} ||x_i - mean(A)||^2
 ```
 
-### 3.2 Cell-ID hashing
+For candidate split `A -> A_left, A_right`, the gain is:
 
-A cell is a tuple of bins `(b₁, b₂, …, b_m)`. Instead of a mixed-radix positional code (which overflows `int64` when `m·log₂(K) > 63`), the implementation uses a **64-bit FNV-1a style hash-combine**:
+```text
+gain = SSE(A) - SSE(A_left) - SSE(A_right)
+```
+
+The best split maximizes `gain`, subject to `min_samples_split`, `min_samples_leaf`, `max_depth`, and feature/threshold sampling constraints.
+
+After fitting, each leaf is a cluster. `rules()` returns human-readable decision rules for each cluster.
+
+## 5. Automatic selection: `AutoTreeClusterer`
+
+`AutoTreeClusterer` is a meta-estimator. It does not introduce a new clustering geometry; instead, it automates a small model-selection loop over existing estimators.
+
+For every candidate algorithm `a`, cluster count `k`, parameter-grid point `theta`, and restart `r`, it fits an estimator:
+
+```text
+M[a, k, theta, r].fit(X) -> labels[a, k, theta, r]
+```
+
+It then computes internal unsupervised scores. Since version 0.6.1, the default silhouette score is computed on a leak-safe scoring representation rather than blindly using each estimator's public `pairwise_distance()` output. This matters because some estimators, especially the interpretable binary tree, define public proximity from final leaf assignments. Scoring such a model on a distance matrix derived from the same final labels would be self-confirming.
+
+Default scoring representations are:
+
+```text
+ForestClusterer                 -> weighted one-hot random-partition features
+UnsupervisedRandomForestClusterer -> one-hot forest leaf features
+ExtraTreesProximityClusterer      -> one-hot ExtraTrees leaf features
+UnsupervisedBinaryTreeClusterer   -> fitted preprocessed feature matrix
+```
+
+The default silhouette objective is therefore:
+
+```text
+silhouette(labels, Phi), where Phi is independent of the final labels
+```
+
+For multiple restarts of the same `(a, k, theta)` candidate, stability is computed with the adjusted Rand index between restart labelings:
+
+```text
+stability = mean_{r1 < r2} ARI(labels_r1, labels_r2)
+```
+
+The default `scoring="combined"` objective is:
+
+```text
+score = mean_silhouette + stability_weight * stability
+```
+
+Other supported objectives are `silhouette`, `calinski_harabasz`, `davies_bouldin`, and `stability`. `scoring_space="proximity"` is kept as an explicit compatibility mode, but it should not be used with estimators whose distance is constructed directly from final cluster labels. After search, the best fitted estimator is stored in `best_estimator_`; `labels_`, `transform`, `similarity_matrix`, and `pairwise_distance` delegate to it.
+
+This procedure is intentionally simple. It is useful because many failures in practical clustering come from choosing a poor cluster count, weak default seed or mismatched algorithm family. It is not a proof that the selected clustering is globally correct.
+
+## 6. Distance, similarity, and proximity APIs
+
+The package uses these conventions:
+
+```text
+proximity_matrix: high means similar, diagonal is 1
+similarity_matrix: alias or equivalent high-similarity matrix
+distance_matrix: low means similar, diagonal is 0
+```
+
+For tree-proximity estimators:
+
+```text
+distance = 1 - proximity
+```
+
+For `ForestClusterer`:
+
+```text
+distance = Hamming(random_partition_embedding)
+similarity = 1 - distance
+```
+
+## 7. Mixed data preprocessing
+
+Tree-proximity estimators use a sklearn preprocessing pipeline:
+
+- numeric columns: imputation, then numeric values are passed to the forest;
+- categorical columns: imputation, then one-hot encoding;
+- all-missing columns are handled robustly where supported by the installed sklearn version.
+
+This makes the new tree estimators usable on pandas DataFrames with missing values and mixed dtypes.
+
+## 8. Choosing an algorithm
+
+| Situation | Recommended estimator |
+|---|---|
+| You want a fast robust baseline | `ForestClusterer` |
+| You want canonical random-forest proximity | `UnsupervisedRandomForestClusterer` |
+| You want a faster/more randomized proximity baseline | `ExtraTreesProximityClusterer` |
+| You need interpretable if/then cluster rules | `UnsupervisedBinaryTreeClusterer` |
+| You do not know algorithm or `k` | `AutoTreeClusterer(k_range=range(2, 8), scoring="combined")` |
+| You need sklearn pipeline integration | `ForestTransformer` + downstream estimator |
+| You have large data | Random-partition embedding + MiniBatchKMeans or graph/LSH helpers |
+
+## 9. Limitations
+
+- Clustering quality is data-dependent; there is no universally correct unsupervised objective.
+- URF/ExtraTrees proximities depend on the synthetic null distribution.
+- Proximity matrices are `O(n^2)` memory; use embeddings or graph approximations for large datasets.
+- Binary tree clustering is interpretable but less expressive than an ensemble.
+- Categorical split semantics depend on preprocessing and category frequency.
+- `AutoTreeClusterer` uses internal validation metrics; these are useful diagnostics, not ground-truth labels.
+
+## 10. Reproducibility
+
+Set `random_state` on the estimator and downstream clusterer when reproducible output is required.
 
 ```python
-HASH_INIT  = 1469598103934665603   # FNV-1a offset basis
-HASH_GOLDEN = 0x9E3779B97F4A7C15   # 2^64 / φ
-
-h = HASH_INIT
-for each bin b in (b1, b2, ..., bm):
-    h = h ^ (b + HASH_GOLDEN + (h << 6) + (h >> 2))
-
-cell_id = h & ((1 << 52) - 1)      # mask to 52 bits
+model = UnsupervisedRandomForestClusterer(
+    n_estimators=300,
+    n_clusters=3,
+    random_state=42,
+)
 ```
 
-**Why 52 bits?** `float64` has 53 bits of mantissa. Masking to 52 guarantees that every `cell_id` is **exactly representable** as `float64`. This matters because `scipy.spatial.distance.cdist` casts the embedding to double; full-range `int64` ids would collide silently and zero out the distance matrix.
+## Cluster-label classifiers and surrogate explanations
 
-The hash is a pure function of the bin tuple, so the same tuple always maps to the same id on training and new data (out-of-sample consistency).
+Version 0.7.0 adds a supervised layer that can be fitted after clustering.  The workflow is:
 
-### 3.3 The n×L embedding matrix
+1. Fit a clustering estimator and obtain labels `z`.
+2. Train a supervised classifier `g(x) -> z` using those labels as pseudo-targets.
+3. Use the classifier for inductive assignment, confidence estimates and explanations.
 
-After `L` iterations each point is described by a vector of cell ids:
+This does not change the original clustering objective.  The classifier is a *surrogate* for the
+cluster assignment function.  Its metrics are therefore fidelity metrics: they describe how well
+`g` reproduces the existing cluster labels, not whether the clusters are semantically correct.
 
-```
-          iter_0   iter_1   iter_2  …  iter_{L-1}
-point_0 [   11       24        3    …      7    ]
-point_1 [   11        5        3    …     42    ]
-point_2 [    7       24       18    …      7    ]
-point_3 [    3        5        9    …     42    ]
-```
+### ClusterLabelClassifier
 
-*Points 0 and 1* matched in iterations 0 and 2 → they are similar under these random projections. Hamming distance simply counts how many iterations they **did not** match.
+`ClusterLabelClassifier` fits a default balanced random forest, or any user-supplied sklearn
+classifier, to reproduce cluster labels.  It first converts mixed-type tabular data to numeric
+features using the same robust preprocessing used by the tree-clustering estimators:
 
-### 3.4 Cut-point strategies
+- missing indicators;
+- rare-category grouping;
+- numeric-string coercion;
+- median imputation and scaling for numeric columns;
+- one-hot encoding for categorical columns.
 
-Three strategies are available for numerical features.
+It exposes:
 
-| Strategy | Mechanism | When to use |
-|---|---|---|
-| **uniform** (default) | `rng.uniform(min, max, size=K-1)` | Fast, no outliers |
-| **quantile** | random sample from empirical quantiles | Outlier-robust |
-| **kde_peaks** | detect valleys between KDE peaks, place cuts there | Density-aware, multimodal data |
+- `labels_`: labels produced by the underlying clusterer;
+- `predict(X_new)`: assign new rows to clusters;
+- `predict_proba(X_new)`: cluster-label probabilities when the classifier supports them;
+- `fidelity_report_`: out-of-fold accuracy, balanced accuracy, macro F1 and confusion matrix;
+- `train_fidelity_report_`: in-sample reproduction metrics;
+- `cluster_profile()` and `explain_clusters()` for readable cluster summaries;
+- plotting methods for cluster sizes, projection plots, feature importances and fidelity matrices.
 
-```mermaid
-flowchart LR
-    subgraph uniform["uniform (default)"]
-        U1["Cuts: linspace(min, max)"]
-        U2["Outlier x=1000 stretches range<br/>→ normal points collapse into one bin"]
-        U1 --> U2
-    end
-    subgraph quantile["quantile"]
-        Q1["Cuts: sampled from data quantiles"]
-        Q2["Outlier gets extreme bin<br/>→ normal points spread evenly"]
-        Q1 --> Q2
-    end
-    subgraph kde["kde_peaks"]
-        K1["KDE → find peaks & valleys"]
-        K2["Cuts placed in valleys<br/>between density modes"]
-        K1 --> K2
-    end
-```
+The optional rejection mode is useful in production.  With `unknown_policy="reject"` and a
+`confidence_threshold`, low-confidence predictions are returned as `-1` instead of being forced
+into a known cluster.
 
-**KDE peaks** (`kde_cuts.py`) workflow:
-1. Subsample large columns (>10 000 rows).
-2. Estimate bandwidth (Silverman / Scott rule, clamped to `range × 1e-4`).
-3. Evaluate Gaussian KDE on a grid.
-4. Find peaks with `scipy.signal.find_peaks`.
-5. Reject flat KDEs (guard against sampling noise).
-6. Select valleys by depth + balance score.
-7. Fall back to uniform if not enough valleys are found.
+### ClusterSurrogateTree
 
----
+`ClusterSurrogateTree` fits a shallow `DecisionTreeClassifier` to cluster labels.  It is meant for
+interpretability rather than maximum fidelity.  It provides:
 
-## 4. Step 3 — Distance & Similarity
+- `export_text()` for a full sklearn-style tree dump;
+- `extract_leaf_rules()` for root-to-leaf rules with sample counts and purity;
+- `explain_rules()` for compact human-readable rules;
+- `rules_dataframe()` for reporting;
+- `plot_tree()` for visual inspection.
 
-### Hamming distance
+For one-hot categorical splits, rules near threshold `0.5` are phrased as presence/absence rather
+than raw numeric dummy thresholds where possible.
 
-```
-D[i,j] = (1/L) · Σ_l 1{ E[i,l] ≠ E[j,l] }   ∈ [0, 1]
-```
+### Recommended use
 
-Implementation uses `scipy.spatial.distance.cdist(..., metric='hamming')`. For `n > 2000` a chunked variant builds the matrix row-by-row to limit memory.
+Use `ClusterLabelClassifier` when the goal is deployment or assigning future observations.  Use
+`ClusterSurrogateTree` when the goal is to explain a segmentation to humans.  If the surrogate has
+low out-of-fold fidelity, treat the clustering as difficult to express in the original feature space
+and avoid over-interpreting simple rules.
 
-### Weighted Hamming
+## 0.8.0 Prototype sampling layer
 
-When `iteration_weighting` is `"entropy"` or `"inverse_gini"`, each iteration `l` receives a weight `w_l` (mean-normalised to 1.0):
+The prototype layer reduces the number of rows before clustering while preserving a reversible mapping back to the original dataset.
 
-```
-D_weighted[i,j] = Σ_l w_l · 1{ E[i,l] ≠ E[j,l] } / Σ_l w_l
-```
+Let `X = {x_i}_{i=1}^n`. A sampler produces:
 
-* **entropy** — rewards iterations with high cell-diversity (high Shannon entropy).
-* **inverse_gini** — rewards iterations with balanced cell sizes (low Gini inequality).
-* **temperature** — `T < 1` sharpens differences, `T > 1` softens them.
+- prototype rows `P = {p_j}_{j=1}^m`, `m <= n`;
+- weights `w_j`, where `w_j` is the number of original rows represented by prototype `j`;
+- inverse assignment `a_i in {0, ..., m-1}` so that labels can be expanded by `label_i = label^P_{a_i}`.
 
-Fast paths: `numba` parallel kernels, or cache-friendly chunked numpy with `joblib` threading.
+### Leaf-signature prototypes
 
-### Sparse weighted one-hot features
+For mixed tabular data, `PrototypeSampler(method="leaf_signature")` fits a `ForestTransformer` and obtains a random-partition signature matrix `E in Z^{n x L}`.  A prefix or full signature is used as a bucket key. Rows in the same bucket are considered redundant under the selected random-partition view.
 
-For centroid estimators (KMeans, MiniBatchKMeans, Birch) the embedding is expanded into a **sparse CSR matrix** with exactly `L` non-zeros per row:
+For each bucket the sampler chooses a representative row:
 
-```python
-# For iteration l with weight w_l and cell c:
-phi[i, offset_l + c] = sqrt(w_l / 2)
-```
+- `first`: deterministic first row;
+- `medoid`: row nearest to the bucket center in signature/feature space;
+- `centroid`: only meaningful for numeric/BIRCH workflows; mixed leaf-signature data keeps valid original rows instead.
 
-Then:
+Small buckets can be preserved as individual prototypes with `preserve_rare=True`. This protects small clusters and outliers from being removed by compression.
 
-```
-||phi_i - phi_j||² = Σ_l w_l · 1{E[i,l] ≠ E[j,l]} = weighted Hamming
-```
+### BIRCH prototypes
 
-This makes KMeans optimise a weighted-Hamming-consistent objective while staying `O(n·L)` in memory, regardless of per-column cardinality.
+`PrototypeSampler(method="birch")` builds a robust numeric/categorical preprocessing pipeline and fits sklearn BIRCH.  Samples assigned to the same BIRCH subcluster are collapsed into a weighted representative. If the target prototype budget is lower than the natural number of subclusters, centers are deterministically merged by farthest-first representative selection and nearest-center assignment.
 
----
+### SubsampledClusterer
 
-## 5. Step 4 — Downstream Clustering
+`SubsampledClusterer` composes a sampler and a clusterer:
 
-`ForestClusterer` automatically routes the embedding to the clusterer in the correct format:
+1. fit sampler on full data;
+2. fit the clusterer on prototypes;
+3. expand prototype labels to all original rows;
+4. predict new rows by assigning them to their nearest fitted prototype.
 
-```mermaid
-flowchart TD
-    A["Clusterer choice"] --> B{{"String shortcut?"}}
-    B -->|"'louvain' / 'leiden'"| C["GraphLouvainClusterer<br/>kNN graph → community detection"]
-    B -->|"estimator"| D{{"metric / type"}}
-    D -->|"metric='precomputed'"| E["pairwise_distance()<br/>dense D n×n<br/>→ estimator.fit_predict(D)"]
-    D -->|"centroid (KMeans, Birch, …)"| F["weighted_onehot_features(E)<br/>sparse CSR<br/>→ estimator.fit_predict(φ)"]
-    D -->|"metric='hamming'"| G["raw embedding E<br/>→ estimator.fit_predict(E)"]
-```
+This is a practical acceleration layer. It is not a new clustering objective, and it should be validated with compression diagnostics.
 
-| Algorithm | Input format | Best for |
-|---|---|---|
-| KMeans / MiniBatchKMeans / Birch | sparse weighted one-hot `φ` | Known `K`, any `n` |
-| AgglomerativeClustering (`precomputed`) | dense Hamming matrix `D` | Non-spherical, `n ≤ 12 000` |
-| DBSCAN (`metric='hamming'`) | raw embedding `E` | Unknown `K`, noise |
-| Louvain / Leiden | LSH-banding kNN graph | Large `n`, no `K` needed |
+## Diagnostics and visualisation layer in 0.9.0
 
-**Size-aware routing.** For `n ≤ 12 000` the Louvain/Leiden path uses the exact dense Hamming matrix (classic behaviour, exact tie-breaking). For `n > 12 000` it switches to the **matrix-free LSH-banding kNN graph** so `O(n²)` memory is never allocated.
+`ClusterDiagnosticsReport` is a post-fit diagnostic layer. It intentionally separates two spaces:
 
----
+1. **Leak-safe feature space**: a robust encoded representation of the original data. This is used for internal metrics such as silhouette, Calinski-Harabasz and Davies-Bouldin.
+2. **Model proximity space**: a clusterer's own similarity/proximity matrix when available. This is used for proximity heatmaps and block-separation diagnostics.
 
-## 6. Advanced mechanisms
+This separation avoids the scoring leakage problem fixed in 0.6.1: a distance matrix derived directly from final labels must not be used as evidence that those labels are good.
 
-### 6.1 Adaptive bins
+The diagnostics module includes:
 
-Instead of a fixed `K` for all features, `adaptive_bins=True` computes per-feature bin counts from column statistics:
+- cluster size balance;
+- negative silhouette rate;
+- per-cluster profile contrasts;
+- proximity block summaries;
+- uncertain sample ranking using silhouette and affinity margin;
+- health checks and cluster cards;
+- stability analysis across repeated fits;
+- model comparison with pairwise adjusted Rand agreement.
 
-```python
-# Score components:
-c_spread = IQR / range          # how spread out is the data?
-c_unique = n_unique / (2·sqrt(n))  # cardinality signal
+`StabilityAnalyzer` repeatedly clones an estimator, changes its random seed where possible, and compares labelings with ARI/NMI. This gives a practical robustness signal for stochastic algorithms.
 
-C = 0.5·c_spread + 0.5·c_unique   # composite score ∈ [0,1]
-K_j = round(min_bins + (max_bins - min_bins) · C)
-```
+`compare_clusterings()` fits several models, computes a shared diagnostics table and builds a pairwise ARI agreement matrix. Agreement across different algorithms is not proof of truth, but it is useful evidence that the discovered structure is not merely a random artifact.
 
-Categorical features automatically get `K_j = clip(n_unique, min_bins, B_max)` where `B_max = min(max_bins, Sturges(n))`.
-
-### 6.2 Correlation-aware selection
-
-Two layers of correlation handling exist:
-
-1. **Feature weights** (`corr_threshold`): strongly correlated features get weight `1/G` where `G` is group size. This reduces selection probability but does not forbid co-selection.
-2. **Correlation-aware selection** (`correlation_aware=True`): at most **one** feature per correlated group is selected in a single iteration. This guarantees diversity within each random partition.
-
-```mermaid
-flowchart TD
-    A["Numerical columns"] --> B["Pearson correlation matrix"]
-    B --> C["Graph: edge if |r| > threshold"]
-    C --> D["Connected components → groups"]
-    D --> E["Group importance = max weight in group"]
-    E --> F["Weighted random selection of groups"]
-    F --> G["Pick highest-weight feature from each selected group"]
-```
-
-### 6.3 Iteration weighting
-
-After the embedding is built, each iteration is scored by the uniformity of its cell-size distribution:
-
-* **entropy** — `w_l ∝ H(cell_distribution) / log(n_unique)`
-* **inverse_gini** — `w_l ∝ Gini_uniformity / Gini_max`
-
-Iterations that split data into a few giant cells (low information) receive near-zero weight; iterations with fine, balanced splits receive high weight.
-
-### 6.4 Contrastive trees
-
-When `contrastive=True`, each iteration builds a small decision tree (max depth ≈ `max(3, n_bins)`) optimised with a contrastive loss:
-
-1. Run KMeans on the node to get pseudo-labels.
-2. Generate positive pairs (same label) and negative pairs (different labels).
-3. At each split, evaluate:
-   ```
-   score = -contrastive_loss + 0.1 · information_gain
-   ```
-4. The tree structure is stored (not just leaf ids), so `transform()` on new data is consistent.
-
-This learns partitions that separate known pseudo-clusters rather than cutting randomly.
-
-### 6.5 LSH-banding kNN graph
-
-For large `n` the exact `n × n` distance matrix is infeasible. The LSH-banding graph builder (`lsh_graph.py`) works directly on the embedding:
-
-1. **Compact codes** — factorise each column to the smallest `uint8/16/32` dtype preserving equality.
-2. **Banding** — split `L` columns into bands of size `r`. Rows sharing the exact same tuple in a band are candidate neighbours.
-3. **Vectorised pair enumeration** — within each bucket, all `i < j` pairs are generated via a closed-form triangular inverse (no Python loops).
-4. **Exact Hamming on candidates** — compute true distance only for candidates.
-5. **Per-row top-k** — a single packed-key `argsort` keeps the `k` nearest neighbours per row.
-
-Memory is `O(n·c)` where `c` is the candidate count, never `O(n²)`. `band_size='auto'` picks the smallest band size that keeps collision load bounded.
-
----
-
-## 7. Online / incremental mode
-
-`partial_fit` allows the clusterer to ingest new data without a full refit:
-
-```mermaid
-flowchart TD
-    A["partial_fit(X_new)"] --> B["Encode X_new with existing encoder"]
-    B --> C["Compute embedding with current specs"]
-    C --> D["Append to accumulated embedding"]
-    D --> E["Update column statistics"]
-    E --> F{"Drift detected?"}
-    F -->|"Yes"| G["Rebuild iteration specs<br/>from accumulated stats"]
-    F -->|"No"| H["Keep current specs"]
-    G --> I["Recompute ALL embeddings"]
-    H --> J["Re-run clusterer on full embedding"]
-    I --> J
-```
-
-Drift is measured per-feature as `max(|Δmean|, |Δstd|) / std_ref`. If the fraction of drifted features exceeds `partial_fit_rebuild_threshold`, the specs are rebuilt. The accumulated data is capped to `partial_fit_max_samples` to prevent unbounded growth.
-
----
-
-## 8. Code map
-
-```
-forest_clustering/
-├── __init__.py               # public exports
-├── clusterer.py              # ForestClusterer (fit, partial_fit, transform, …)
-├── transformer.py            # ForestTransformer (sklearn TransformerMixin)
-├── partitioner.py            # build_iteration_specs, compute_embedding, _cell_ids
-├── feature_encoder.py        # DataEncoder, auto type detection
-├── correlation.py            # Spearman-based feature weighting
-├── correlation_aware.py      # group building & correlation-aware selection
-├── adaptive_bins.py          # per-feature optimal bin counts
-├── kde_cuts.py               # density-aware cut-point generation
-├── distance.py               # pairwise Hamming (exact & chunked)
-├── weighted_distance.py      # weighted Hamming + numba fast paths
-├── iteration_weights.py      # entropy / inverse-gini weighting
-├── sparse_features.py        # weighted one-hot CSR for centroid clusterers
-├── graph_clustering.py       # GraphLouvainClusterer (Louvain & Leiden)
-├── lsh_graph.py              # batched Hamming kNN + LSH banding kNN
-├── contrastive_splits.py     # contrastive tree fitting
-├── permutation_importance.py # feature importance via permutation
-├── preflight.py              # Hopkins, Gap, clusterability_test
-└── significance.py           # ARI permutation, bootstrap CI, silhouette sig
-```
-
-```mermaid
-flowchart LR
-    CLI["clusterer.py"] --> FE["feature_encoder.py"]
-    CLI --> PART["partitioner.py"]
-    CLI --> CORR["correlation.py"]
-    CLI --> DIST["distance.py"]
-    CLI --> GRAPH["graph_clustering.py"]
-    CLI --> LSH["lsh_graph.py"]
-    CLI --> SPARSE["sparse_features.py"]
-    FE --> PART
-    CORR --> PART
-    PART --> DIST
-    PART --> LSH
-    DIST --> GRAPH
-    LSH --> GRAPH
-    SPARSE --> CLI
-```
+When an ordinary sklearn baseline cannot consume mixed-type data, `compare_clusterings()` can retry the model on the same robust encoded feature matrix used for diagnostics. The resulting `input_space` column records whether the model used original data or encoded fallback.

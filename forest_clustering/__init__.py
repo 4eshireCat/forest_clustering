@@ -1,4 +1,11 @@
 from .clusterer import ForestClusterer
+from .urf import UnsupervisedRandomForestClusterer
+from .extra_trees import ExtraTreesProximityClusterer
+from .binary_tree import UnsupervisedBinaryTreeClusterer
+from .auto import AutoTreeClusterer
+from .explain import ClusterLabelClassifier, ClusterSurrogateTree, ClusterRule
+from .prototypes import PrototypeSampler, SubsampledClusterer, CompressionReport
+from .diagnostics import ClusterDiagnosticsReport, StabilityAnalyzer, ClusterComparison, compare_clusterings, HealthCheck
 from .distance import pairwise_hamming, pairwise_hamming_chunked, cross_hamming
 from .iteration_weights import compute_iteration_weights
 from .weighted_distance import (
@@ -37,10 +44,25 @@ from .contrastive_splits import (
     build_contrastive_tree,
 )
 
-__version__ = "0.4.0"
+__version__ = "0.9.0"
 
 __all__ = [
     "ForestClusterer",
+    "UnsupervisedRandomForestClusterer",
+    "ExtraTreesProximityClusterer",
+    "UnsupervisedBinaryTreeClusterer",
+    "AutoTreeClusterer",
+    "ClusterLabelClassifier",
+    "ClusterSurrogateTree",
+    "ClusterRule",
+    "PrototypeSampler",
+    "SubsampledClusterer",
+    "CompressionReport",
+    "ClusterDiagnosticsReport",
+    "StabilityAnalyzer",
+    "ClusterComparison",
+    "compare_clusterings",
+    "HealthCheck",
     "ForestTransformer",
     "GraphLouvainClusterer",
     "pairwise_hamming",

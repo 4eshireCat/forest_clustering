@@ -1,57 +1,69 @@
 [build-system]
-requires = ["setuptools>=68", "wheel"]
+requires = ["setuptools>=77", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "forest-clustering"
-version = "0.4.0"
-description = "Random-partition similarity clustering for mixed-type tabular data"
+version = "0.9.0"
+description = "Tree-based and random-partition clustering for mixed-type tabular data"
 readme = "README.md"
-license = "MIT"
-license-files = ["LICENSE"]
-authors = [{ name = "Vladislav Kozlov", email = "vlad.kneu@gmail.com" }]
 requires-python = ">=3.10"
+license = "MIT"
+authors = [
+  {name = "Vladislav Kozlov"},
+]
 keywords = [
-    "clustering",
-    "unsupervised learning",
-    "random forests",
-    "tabular data",
-    "mixed data",
-    "similarity embedding",
+  "clustering",
+  "unsupervised learning",
+  "random forests",
+  "tree clustering",
+  "tabular data",
+  "mixed data",
+  "similarity embedding",
 ]
 classifiers = [
-    "Development Status :: 3 - Alpha",
-    "Intended Audience :: Science/Research",
-    "Intended Audience :: Developers",
-    "Programming Language :: Python :: 3",
-    "Programming Language :: Python :: 3.10",
-    "Programming Language :: Python :: 3.11",
-    "Programming Language :: Python :: 3.12",
-    "Topic :: Scientific/Engineering :: Artificial Intelligence",
-    "Topic :: Scientific/Engineering :: Information Analysis",
-    "Operating System :: OS Independent",
+  "Development Status :: 3 - Alpha",
+  "Intended Audience :: Developers",
+  "Intended Audience :: Science/Research",
+  "Operating System :: OS Independent",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.10",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+  "Topic :: Scientific/Engineering :: Artificial Intelligence",
+  "Topic :: Scientific/Engineering :: Information Analysis",
 ]
+[project.urls]
+"Homepage" = "https://github.com/4eshireCat/forest_clustering/"
+"Repository" = "https://github.com/4eshireCat/forest_clustering/"
+"Bug Tracker" = "https://github.com/4eshireCat/forest_clustering/issues"
 dependencies = [
-    "numpy>=1.24",
-    "scipy>=1.10",
-    "scikit-learn>=1.3",
-    "pandas>=2.0",
-    "joblib>=1.3",
+  "numpy>=1.23",
+  "pandas>=1.5",
+  "scipy>=1.9",
+  "scikit-learn>=1.2",
+  "joblib>=1.2",
 ]
 
 [project.optional-dependencies]
-dev = ["pytest", "pytest-cov", "build", "twine"]
-graph = ["networkx>=3.0"]
-leiden = ["leidenalg>=0.10", "igraph>=0.11"]
-
-[project.urls]
-Homepage = "https://github.com/vkozlov-1/forestClustering"
-Repository = "https://github.com/vkozlov-1/forestClustering"
-Documentation = "https://github.com/vkozlov-1/forestClustering/blob/master/ALGORITHM.md"
+dev = [
+  "pytest>=7",
+  "build>=1.0",
+  "twine>=5.0",
+]
+graph = [
+  "networkx>=3.0",
+]
+leiden = [
+  "igraph>=0.10",
+  "leidenalg>=0.10",
+]
 
 [tool.setuptools.packages.find]
 where = ["."]
 include = ["forest_clustering*"]
 
-[tool.setuptools.package-data]
-forest_clustering = []
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"

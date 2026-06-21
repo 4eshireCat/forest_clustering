@@ -1,442 +1,454 @@
 # forest-clustering
 
-**Random-partition similarity clustering for mixed-type tabular data with outlier robustness, correlation-aware feature selection and scalable large‑n paths.**
+Tree-based and random-partition clustering for mixed-type tabular data.
 
-`forest-clustering` builds a compact integer embedding from random feature partitions and then applies any sklearn-compatible clustering algorithm to that embedding. It handles **numerical**, **categorical**, and **mixed** data natively, automatically detects feature types, down-weights correlated features, supports density-aware cut-points, contrastive tree splits, and scales to 100 K+ rows without materialising a dense `O(n²)` distance matrix.
+`forest-clustering` provides sklearn-style estimators that convert tabular rows into tree or partition embeddings, compute sample-to-sample similarities, and then run a downstream clustering algorithm. It is designed for practical unsupervised learning on mixed numerical/categorical data where Euclidean distance is often a poor default.
 
----
+## What is included
 
-## What makes it different
-
-| Capability | forest-clustering | KMeans | DBSCAN | HDBSCAN | Agglomerative |
-|---|---|---|---|---|---|
-| Mixed-type (num + cat) | **native** | no | no | no | no |
-| Outlier-robust cuts | **quantile / KDE peaks** | no | no | no | no |
-| Correlated-feature down-weighting | **built-in** | no | no | no | no |
-| Adaptive bins per feature | **yes** | no | no | no | no |
-| Contrastive tree splits | **yes** | no | no | no | no |
-| Graph clustering (Louvain / Leiden) | **yes** | no | no | no | no |
-| `O(n·L)` memory for large `n` | **yes** | no | no | no | no |
-| Incremental / online `partial_fit` | **yes** | no | no | no | no |
-| Permutation feature importance | **yes** | no | no | no | no |
-| Preflight clusterability tests | **yes** | no | no | no | no |
-| Statistical significance of clusters | **yes** | no | no | no | no |
-
-*ForestClusterer does not replace the above algorithms — it wraps them.* You still use KMeans, DBSCAN, AgglomerativeClustering, etc., but you run them on a robust, mixed-type-aware embedding instead of raw data.
-
----
-
-## Installation
-
-### PyPI (recommended)
-
-```bash
-# Core library — everything except optional graph backends
-pip install forest-clustering
-
-# With NetworkX Louvain support
-pip install "forest-clustering[graph]"
-
-# With Leiden (leidenalg + igraph) support — faster, better communities
-pip install "forest-clustering[leiden]"
-
-# With numba — accelerates weighted Hamming distance computation (2–5× faster)
-pip install "forest-clustering[numba]"
-
-# All optional backends
-pip install "forest-clustering[graph,leiden,numba]"
-```
-
-Python ≥ 3.10 is required.
-
-### Editable install from source
-
-```bash
-git clone https://github.com/<your-org>/forest-clustering.git
-cd forest-clustering
-pip install -e ".[dev,graph,leiden]"
-pytest -q          # 979 tests expected
-```
-
-### Dependencies
-
-| Package | Minimum | Notes |
+| Estimator | Core idea | Best use case |
 |---|---|---|
-| numpy | — | — |
-| pandas | — | — |
-| scipy | — | KDE, correlation, sparse matrices |
-| scikit-learn | — | Base estimators, metrics |
-| joblib | — | Parallel embedding computation |
-| networkx | optional | `community_method='louvain'` |
-| leidenalg + igraph | optional | `community_method='leiden'` |
-| numba | optional | Accelerated weighted Hamming distances |
+| `ForestClusterer` | Random feature partitions produce an integer embedding; Hamming similarity measures co-partitioning. | Fast mixed-type clustering, large tabular data, robust random-partition baseline. |
+| `UnsupervisedRandomForestClusterer` | Breiman-style unsupervised random forest: real rows vs synthetic null rows, then same-leaf proximity. | Canonical random-forest proximity clustering. |
+| `ExtraTreesProximityClusterer` | ExtraTrees version of the synthetic-null forest; more randomized splits and fast leaf proximity. | Faster tree-proximity baseline with strong randomization. |
+| `UnsupervisedBinaryTreeClusterer` | Greedy interpretable binary tree that recursively splits rows to reduce within-leaf variance. | Explainable cluster rules and small/medium tabular datasets. |
+| `AutoTreeClusterer` | Tries several tree-based estimators, cluster counts, parameter grids and random restarts; selects the best by internal score/stability. | Practical autoparameter selection when you do not know the best algorithm or `k`. |
+| `ForestTransformer` | Transformer-only wrapper around `ForestClusterer`. | sklearn pipelines and custom downstream models. |
 
----
+The package also includes weighted Hamming distances, graph helpers, adaptive bins, KDE-based cut points, permutation importance, clusterability checks, and significance utilities.
 
-## How it works (in 30 seconds)
+## Autotuning in 0.6.x
 
-1. **Encode** — `DataEncoder` auto-detects numerical vs categorical columns and label-encodes categories.
-2. **Partition** — for `L` iterations randomly select `m` features, draw `K‑1` cut-points (uniform, quantile, or KDE peaks), and assign each sample a **cell ID**.
-3. **Embed** — the result is an `n × L` integer matrix `E`. Two points that land in the same cell are similar.
-4. **Cluster** — Hamming distance on `E` approximates true similarity. Any sklearn clusterer can consume `E` directly, a precomputed distance matrix, or a sparse weighted one-hot expansion of `E`.
+The 0.6 release line adds `AutoTreeClusterer`, a sklearn-style meta-estimator for simple, practical autoparameter selection. It can search across algorithms, cluster counts, small algorithm-specific grids and random restarts. Version 0.6.1 fixes an important model-selection issue: internal silhouette scoring now uses leak-safe feature representations by default instead of distances that may be derived from the candidate final labels.
 
-The full algorithm description with diagrams is in [ALGORITHM.md](ALGORITHM.md).
+```python
+from forest_clustering import AutoTreeClusterer
 
----
+model = AutoTreeClusterer(
+    algorithms=("forest", "urf", "extratrees", "binary_tree"),
+    k_range=range(2, 8),
+    scoring="combined",          # leak-safe silhouette + stability
+    scoring_space="auto",         # default; avoids label-derived distance leakage
+    n_restarts=3,
+    estimator_params={
+        "forest": {"n_iterations": [100, 200], "n_bins": ["auto", 4]},
+        "urf": {"n_estimators": [100]},
+        "extratrees": {"n_estimators": [100]},
+        "binary_tree": {"max_depth": [None, 6]},
+    },
+    add_missing_indicators=True,
+    rare_category_min_count=5,
+    coerce_numeric_strings=True,
+    random_state=42,
+)
 
-## Quick start
+labels = model.fit_predict(X)
+print(model.best_algorithm_, model.best_n_clusters_, model.best_score_)
+print(model.cv_results_.head())
+```
 
-### Basic clustering
+Supported scoring modes are `"silhouette"`, `"calinski_harabasz"`, `"davies_bouldin"`, `"stability"`, and `"combined"`. By default, `scoring_space="auto"` uses leak-safe feature-space scoring: weighted partition features for `ForestClusterer`, one-hot leaf features for URF/ExtraTrees, and the preprocessed feature matrix for `UnsupervisedBinaryTreeClusterer`. `scoring_space="proximity"` is available only as an explicit compatibility mode. The selected estimator is available as `model.best_estimator_`, and matrix APIs delegate to it: `similarity_matrix()`, `pairwise_distance()`, and `transform(X)`.
+
+## Quality fixes in 0.5.1
+
+The 0.5.1 release focuses on practical clustering quality and safer defaults:
+
+- `auto_tune_dbscan=False` by default: DBSCAN parameters are no longer silently changed.
+- `cluster_input="auto" | "embedding" | "onehot" | "distance" | "similarity"`: explicit downstream input control.
+- `add_missing_indicators=True`: append binary missingness indicators.
+- `rare_category_min_count` / `rare_category_min_freq`: group rare and unseen categories into a stable rare bucket.
+- `coerce_numeric_strings=True`: treat numeric object/string columns as numeric features.
+- `n_bins="auto"`: simple sample-size-aware bin selection.
 
 ```python
 from forest_clustering import ForestClusterer
-from sklearn.cluster import KMeans
 
-fc = ForestClusterer(
+model = ForestClusterer(
+    n_bins="auto",
+    n_clusters=3,
+    add_missing_indicators=True,
+    rare_category_min_count=5,
+    coerce_numeric_strings=True,
+    cluster_input="auto",
+    random_state=42,
+)
+labels = model.fit_predict(X)
+```
+
+## Installation
+
+```bash
+pip install forest-clustering
+```
+
+Python `>=3.10` is required.
+
+## Quick start
+
+```python
+import pandas as pd
+from forest_clustering import ForestClusterer
+
+X = pd.DataFrame({
+    "age": [22, 38, 26, 35, 54, 2],
+    "fare": [7.25, 71.28, 7.92, 53.10, 51.86, 21.08],
+    "sex": ["male", "female", "female", "female", "male", "male"],
+    "pclass": [3, 1, 3, 1, 1, 3],
+})
+
+model = ForestClusterer(
     n_iterations=200,
     n_bins=3,
-    quantile_cuts=True,          # robust to outliers
-    corr_threshold=0.9,          # down-weight correlated duplicates
-    clusterer=KMeans(n_clusters=5, n_init="auto", random_state=0),
+    cut_strategy="quantile",
     random_state=42,
 )
 
-labels = fc.fit_predict(df)      # DataFrame or ndarray
+labels = model.fit_predict(X)
+embedding = model.get_embedding()
+distance = model.pairwise_distance()
+similarity = model.similarity_matrix()
 ```
 
-### Graph community detection (Louvain & Leiden)
+## Tree-proximity clustering
 
-Graph-based community detection is recommended when the number of clusters is unknown and the dataset is large (`n > 12 000`), because it uses a sparse kNN graph instead of a dense `O(n²)` distance matrix.
-
-#### String shortcuts (simplest)
+### Breiman-style unsupervised random forest
 
 ```python
-# Louvain — works with the [graph] extra
-fc = ForestClusterer(
-    n_iterations=300,
-    clusterer='louvain:k=20,resolution=1.2',
-    random_state=42,
-)
-labels = fc.fit_predict(df)
+from forest_clustering import UnsupervisedRandomForestClusterer
 
-# Leiden — needs [leiden] extra; usually faster and avoids badly-connected communities
-fc = ForestClusterer(
-    n_iterations=300,
-    clusterer='leiden:k=20,resolution=1.5',
+urf = UnsupervisedRandomForestClusterer(
+    n_estimators=300,
+    n_clusters=4,
+    synthetic="permute_marginals",
     random_state=42,
 )
-labels = fc.fit_predict(df)
+
+labels = urf.fit_predict(X)
+proximity = urf.proximity_matrix()
+leaf_ids = urf.transform(X)
+leaf_onehot = urf.transform_onehot(X)
 ```
 
-#### Direct GraphLouvainClusterer (full control)
+The estimator builds a synthetic null dataset, trains a random forest to separate observed rows from synthetic rows, and uses same-leaf co-occurrence as a proximity score.
+
+### ExtraTrees proximity clustering
 
 ```python
-from forest_clustering import GraphLouvainClusterer
+from forest_clustering import ExtraTreesProximityClusterer
 
-# Louvain with custom parameters
-graph_clf = GraphLouvainClusterer(
-    n_neighbors=15,
-    resolution=1.0,
-    weight_transform='exp',      # 'exp', 'linear', 'inverse'
-    noise_strategy='mark',       # 'mark' (-1), 'merge', 'singleton'
-    mutual_knn=False,            # True for stricter connectivity
-    community_method='louvain',
+xt = ExtraTreesProximityClusterer(
+    n_estimators=300,
+    n_clusters=4,
+    synthetic="uniform_box",
     random_state=42,
 )
 
-fc = ForestClusterer(
-    n_iterations=300,
-    clusterer=graph_clf,
-    random_state=42,
-)
-labels = fc.fit_predict(df)
+labels = xt.fit_predict(X)
 ```
 
-#### Leiden with aggressive resolution (more, smaller clusters)
+This estimator uses the same synthetic-null idea as URF, but with `ExtraTreesClassifier`, producing more randomized split geometry.
+
+### Interpretable binary tree clustering
 
 ```python
-from forest_clustering import GraphLouvainClusterer
+from forest_clustering import UnsupervisedBinaryTreeClusterer
 
-graph_clf = GraphLouvainClusterer(
-    n_neighbors=20,
-    resolution=2.0,              # higher → more communities
-    community_method='leiden',
+bt = UnsupervisedBinaryTreeClusterer(
+    n_clusters=4,
+    max_depth=5,
+    min_samples_leaf=10,
     random_state=42,
 )
 
-fc = ForestClusterer(
-    n_iterations=300,
-    clusterer=graph_clf,
+labels = bt.fit_predict(X)
+rules = bt.rules()
+```
+
+Use this when you need human-readable cluster rules instead of only a proximity matrix.
+
+### Automatic parameter selection
+
+```python
+from forest_clustering import AutoTreeClusterer
+
+auto = AutoTreeClusterer(
+    algorithms=("forest", "urf", "extratrees"),
+    k_range=(2, 3, 4, 5),
+    scoring="combined",
+    n_restarts=3,
     random_state=42,
 )
-labels = fc.fit_predict(df)
+
+labels = auto.fit_predict(X)
+best_model = auto.best_estimator_
+results = auto.cv_results_
 ```
 
-#### Matrix-free graph clustering on embedding (no dense distance matrix)
+`AutoTreeClusterer` is deliberately conservative: it does not claim to find a universally true clustering. It automates the practical choices users normally tune by hand: algorithm family, cluster count, selected hyperparameters and seed robustness.
+
+## Using custom downstream clusterers
+
+All estimators keep a sklearn-like interface. For proximity-based tree estimators, downstream clusterers with `metric="precomputed"` receive a distance matrix. Other clusterers receive a sparse one-hot leaf embedding, not raw leaf ids.
 
 ```python
-from forest_clustering import ForestClusterer, GraphLouvainClusterer
+from sklearn.cluster import AgglomerativeClustering, KMeans
+from forest_clustering import UnsupervisedRandomForestClusterer
 
-# Step 1: build embedding only
-fc = ForestClusterer(
-    n_iterations=300,
-    n_bins=3,
-    random_state=42,
-)
-fc.fit(df)
-E = fc.get_embedding()           # (n, L) int64
+# Distance-matrix downstream clustering
+agg = AgglomerativeClustering(n_clusters=3, metric="precomputed", linkage="average")
+model = UnsupervisedRandomForestClusterer(clusterer=agg, random_state=0)
+labels = model.fit_predict(X)
 
-# Step 2: cluster on embedding directly (matrix-free)
-graph_clf = GraphLouvainClusterer(
-    n_neighbors=15,
-    resolution=1.0,
-    community_method='leiden',
-    random_state=42,
-)
-graph_clf.fit_embedding(E, method='auto')   # 'auto' | 'knn' | 'banding'
-labels = graph_clf.labels_
+# Feature-matrix downstream clustering
+km = KMeans(n_clusters=3, n_init="auto", random_state=0)
+model = UnsupervisedRandomForestClusterer(clusterer=km, random_state=0)
+labels = model.fit_predict(X)
 ```
 
-#### Manual kNN graph construction and symmetrization
+## sklearn pipeline usage
 
 ```python
-from forest_clustering import batched_hamming_knn, symmetrize_knn
-from forest_clustering import GraphLouvainClusterer
+from sklearn.pipeline import make_pipeline
+from sklearn.cluster import MiniBatchKMeans
+from forest_clustering import ForestTransformer
 
-# Build embedding
-fc = ForestClusterer(n_iterations=200, random_state=42)
-E = fc.fit_transform(df)
-
-# Exact batched kNN graph (Hamming distances)
-G = batched_hamming_knn(E, k=15)
-
-# Symmetrize: A_bar[i,j] = max(A[i,j], A[j,i])
-G_sym = symmetrize_knn(G)
-
-# Run Louvain on the symmetrized graph
-graph_clf = GraphLouvainClusterer(
-    n_neighbors=15,
-    resolution=1.0,
-    community_method='louvain',
-    random_state=42,
-)
-# Convert to distance matrix or use fit_embedding
-graph_clf.fit_embedding(E, method='knn')
-labels = graph_clf.labels_
-```
-
-#### LSH banding for very large n (sub-quadratic, bounded memory)
-
-```python
-from forest_clustering import lsh_banding_knn, GraphLouvainClusterer
-
-# For n > 20 000, banding avoids O(n²) memory
-G = lsh_banding_knn(E, k=15, band_size='auto', max_bucket=150)
-
-graph_clf = GraphLouvainClusterer(
-    n_neighbors=15,
-    resolution=1.0,
-    community_method='leiden',
-    random_state=42,
-)
-graph_clf.fit_embedding(E, method='banding')  # or pass G manually
-labels = graph_clf.labels_
-```
-
-#### Noise handling strategies
-
-```python
-# 'mark' — singleton communities become -1 (noise)
-fc = ForestClusterer(
-    clusterer='louvain:k=15,resolution=1.0',
-    random_state=42,
-)
-labels = fc.fit_predict(df)
-noise_mask = labels == -1
-
-# 'merge' — singletons merged into nearest non-singleton community
-graph_clf = GraphLouvainClusterer(
-    noise_strategy='merge',
-    community_method='louvain',
+pipe = make_pipeline(
+    ForestTransformer(n_iterations=300, n_bins=3, random_state=42),
+    MiniBatchKMeans(n_clusters=5, random_state=42),
 )
 
-# 'singleton' — keep singletons as separate 1-point clusters
-graph_clf = GraphLouvainClusterer(
-    noise_strategy='singleton',
-    community_method='louvain',
-)
+labels = pipe.fit_predict(X)
 ```
 
-### Advanced: adaptive bins + correlation-aware selection + KDE peaks
-
-```python
-fc = ForestClusterer(
-    n_iterations=300,
-    adaptive_bins=True,
-    min_bins=2,
-    max_bins=10,
-    correlation_aware=True,
-    corr_group_threshold=0.7,
-    cut_strategy='kde_peaks',   # density-aware cut-points
-    clusterer=KMeans(n_clusters=5, n_init="auto"),
-    random_state=42,
-)
-labels = fc.fit_predict(df)
-```
-
-### Contrastive splits (learned trees instead of random cuts)
-
-```python
-fc = ForestClusterer(
-    n_iterations=100,
-    contrastive=True,           # contrastive tree building per iteration
-    n_bins=3,
-    clusterer=KMeans(n_clusters=3, n_init="auto"),
-    random_state=42,
-)
-labels = fc.fit_predict(df)
-```
-
-### Iteration weighting (entropy / inverse-Gini)
-
-```python
-fc = ForestClusterer(
-    n_iterations=200,
-    iteration_weighting='entropy',      # or 'inverse_gini'
-    weight_temperature=0.5,             # < 1 sharpens, > 1 softens
-    clusterer=KMeans(n_clusters=3, n_init="auto"),
-    random_state=42,
-)
-labels = fc.fit_predict(df)
-```
-
-### Online / incremental learning
-
-```python
-fc = ForestClusterer(
-    n_iterations=200,
-    partial_fit_strategy='drift',     # 'drift', 'periodic', 'never'
-    partial_fit_drift_threshold=0.3,
-    partial_fit_rebuild_threshold=0.3,
-    random_state=42,
-)
-fc.fit(X_first)
-fc.partial_fit(X_new)   # detects drift, rebuilds specs if needed
-```
-
-### Permutation feature importance
-
-```python
-fc = ForestClusterer(
-    n_iterations=200,
-    compute_importance=True,
-    importance_repeats=5,
-    importance_metric='silhouette',
-    random_state=42,
-)
-fc.fit(df)
-print(fc.get_feature_importances(detailed=True))
-```
-
-### Preflight clusterability check
-
-```python
-from forest_clustering import hopkins_statistic, gap_statistic, clusterability_test
-
-report = clusterability_test(X, method='both', random_state=42)
-print(report['recommendation'])
-# "proceed with clustering"  or  "no significant cluster structure detected"
-```
-
-### Statistical significance of clusters
-
-```python
-from forest_clustering import cluster_significance, permutation_test_ari
-
-# Per-cluster silhouette significance
-sig = cluster_significance(X, labels, n_bootstrap=100, correction_method='bonferroni')
-print(f"Significant clusters: {sig['significant_clusters']}")
-
-# ARI significance vs ground truth
-res = permutation_test_ari(y_true, labels, n_permutations=1000)
-print(f"ARI={res['ari_observed']:.3f}, p={res['p_value']:.4f}")
-```
-
-### Transform new data
-
-```python
-E_new = fc.transform(X_new)              # (n_new, L) embedding
-D_new = fc.pairwise_distance(Y=X_new)  # (n_train, n_new) Hamming distance train→new
-```
-
----
-
-## Parameters
-
-| Parameter | Default | Description |
-|---|---|---|
-| `n_iterations` | `200` | Number of random partitioning iterations `L`. More → more stable embeddings. |
-| `n_features` | `"sqrt"` | Features selected per iteration: `int`, `float` fraction, `"sqrt"`, `"log2"`. |
-| `n_bins` | `3` | Default number of bins per feature per iteration `K`. |
-| `clusterer` | `None` | Any sklearn-compatible estimator, or strings `'louvain'`, `'leiden'` with optional params (e.g. `'leiden:k=20,resolution=1.5'`). |
-| `corr_threshold` | `0.7` | Spearman \|r\| threshold for grouping correlated features. `None` disables. |
-| `corr_sample_size` | `10_000` | Rows sampled for correlation estimation. |
-| `feature_types` | `None` | Override auto-detection: `{col: "numerical"\|"categorical"}`. |
-| `cat_threshold` | `10` | Integer columns with ≤ this many unique values are treated as categorical. |
-| `quantile_cuts` | `False` | Sample cut-points from empirical quantiles (outlier robust). |
-| `cut_strategy` | `"uniform"` | `"uniform"`, `"quantile"`, or `"kde_peaks"` (density-aware). |
-| `kde_params` | `None` | Dict of overrides for KDE peak detection (bandwidth, grid_resolution, …). |
-| `adaptive_bins` | `False` | Compute optimal `K` per feature from spread and cardinality. |
-| `min_bins` / `max_bins` | `2` / `10` | Bounds when `adaptive_bins=True`. |
-| `correlation_aware` | `False` | Ensure at most one feature per correlated group is selected per iteration. |
-| `corr_group_threshold` | `0.7` | Pearson threshold for grouping in correlation-aware mode. |
-| `iteration_weighting` | `"uniform"` | `"uniform"`, `"entropy"`, `"inverse_gini"`. |
-| `weight_temperature` | `1.0` | Temperature for sharpening / softening iteration weights. |
-| `contrastive` | `False` | Use contrastive trees instead of random cuts. |
-| `compute_importance` | `False` | Compute permutation feature importance after fit. |
-| `auto_feature_types` | `"naive"` | `"naive"` (dtype-only) or `"smart"` (heuristic ID / cardinality detection). |
-| `partial_fit_strategy` | `"drift"` | `"drift"`, `"periodic"`, `"never"`. |
-| `n_jobs` | `-1` | Parallelism for embedding computation. |
-| `random_state` | `None` | Seed for reproducibility. |
-
-See docstrings for the full parameter list (e.g. `partial_fit_max_samples`, `importance_repeats`, etc.).
-
----
-
-## Hyperparameter guidelines
+## Practical recommendations
 
 | Goal | Recommendation |
 |---|---|
-| Fast prototype | `n_iterations=50`, `n_bins=3` |
-| Balanced quality / speed | `n_iterations=200`, `n_bins=3` (default) |
-| High stability | `n_iterations=500`, `n_bins=4` |
-| Outlier-heavy data | `quantile_cuts=True` or `cut_strategy='kde_peaks'` |
-| Many correlated features | `corr_threshold=0.8–0.9`, `correlation_aware=True` |
-| Unknown K, noise present | `clusterer='louvain'` or `DBSCAN(metric='hamming')` |
-| Very large `n` (> 50 K) | `clusterer='louvain'` (LSH-banding kNN, no dense matrix) |
-| Mixed-type data | leave `feature_types=None`, use `auto_feature_types='smart'` |
+| Fast baseline | `ForestClusterer(n_iterations=100, n_bins=3)` |
+| Robust mixed-type clustering | `ForestClusterer(cut_strategy="quantile", corr_threshold=0.8)` |
+| Canonical tree proximity | `UnsupervisedRandomForestClusterer(n_estimators=300)` |
+| Faster randomized tree proximity | `ExtraTreesProximityClusterer(n_estimators=300)` |
+| Explainable clusters | `UnsupervisedBinaryTreeClusterer(n_clusters=k)` |
+| Unknown algorithm / cluster count | `AutoTreeClusterer(k_range=range(2, 8), scoring="combined")` |
+| Unknown number of clusters but fixed algorithm | Pair proximity/distance with `DBSCAN`, HDBSCAN, or graph clustering. |
+| Large data | Use `MiniBatchKMeans` on embeddings or graph/LSH helpers. |
 
----
+## API summary
 
-## Utilities
+Most estimators implement:
 
 ```python
-# Raw embedding
-E = fc.get_embedding()                 # (n, L) int64
-
-# Pairwise Hamming distance (chunked automatically for large n)
-D = fc.pairwise_distance()              # (n, n) float32
-D_cross = fc.pairwise_distance(Y=X_new) # (n, n_new) train→new Hamming
-
-# Iteration weights
-w = fc.get_iteration_weights()         # (L,) float64, mean = 1.0
-
-# Drift report (after partial_fit)
-report = fc.get_drift_report()
+fit(X, y=None)
+fit_predict(X, y=None)
+fit_transform(X, y=None)
+transform(X)
+pairwise_distance(...)
+similarity_matrix(...)
 ```
 
----
+`AutoTreeClusterer` additionally exposes `best_estimator_`, `best_algorithm_`, `best_n_clusters_`, `best_score_`, `best_params_`, `cv_results_`, and `search_results_`.
+
+Tree-proximity estimators also implement:
+
+```python
+proximity_matrix(X=None, Y=None)
+transform_onehot(X)   # URF and ExtraTrees
+```
+
+`UnsupervisedBinaryTreeClusterer` also implements:
+
+```python
+predict(X)
+rules()
+```
+
+## Development
+
+```bash
+python -m pip install -e ".[dev]"
+python -m pytest -q
+```
+
+## Build and deploy
+
+Build distribution archives:
+
+```bash
+python -m pip install --upgrade build twine
+rm -rf dist build *.egg-info
+python -m build
+python -m twine check dist/*
+```
+
+Upload to TestPyPI first:
+
+```bash
+python -m twine upload --repository testpypi dist/*
+```
+
+Upload to PyPI after verifying the TestPyPI package:
+
+```bash
+python -m twine upload dist/*
+```
+
+Use API tokens rather than account passwords. For token-based uploads, username is usually `__token__` and the password is the token value.
+
+## Documentation
+
+See [`ALGORITHM.md`](ALGORITHM.md) for the mathematical and implementation details.
 
 ## License
 
 MIT
+
+
+## Explaining clusters and assigning new samples
+
+Version 0.7.0 adds a supervised explanation layer.  The clusterer still defines the segmentation; the classifier learns to reproduce those labels for deployment and interpretation.
+
+```python
+from forest_clustering import AutoTreeClusterer, ClusterLabelClassifier, ClusterSurrogateTree
+
+clusterer = AutoTreeClusterer(
+    algorithms=("forest", "urf", "extratrees", "binary_tree"),
+    k_range=range(2, 8),
+    scoring="combined",
+    random_state=42,
+)
+
+assigner = ClusterLabelClassifier(
+    clusterer=clusterer,
+    cv=5,
+    confidence_threshold=0.60,
+    unknown_policy="reject",
+    random_state=42,
+)
+assigner.fit(X)
+
+labels = assigner.labels_              # labels from the clusterer
+new_labels = assigner.predict(X_new)    # -1 for low-confidence rows when reject mode is enabled
+proba = assigner.predict_proba(X_new)
+print(assigner.fidelity_summary())
+print(assigner.explain_clusters())
+```
+
+For compact rules, fit a shallow surrogate decision tree:
+
+```python
+explainer = ClusterSurrogateTree(
+    clusterer=clusterer,
+    max_depth=4,
+    min_samples_leaf=20,
+    random_state=42,
+).fit(X)
+
+print(explainer.explain_rules(min_purity=0.70))
+print(explainer.rules_dataframe())
+```
+
+Visualization helpers return matplotlib axes and can be used in notebooks:
+
+```python
+assigner.plot_cluster_sizes()
+assigner.plot_embedding()
+assigner.plot_feature_importances(top_n=15)
+assigner.plot_fidelity_confusion_matrix(normalize=True)
+explainer.plot_tree()
+```
+
+The reported accuracy, balanced accuracy and F1 are **fidelity metrics**: they measure how well the supervised surrogate reproduces cluster labels.  They are not external clustering-quality scores.
+
+## Prototype sampling and subsampled clustering
+
+Version 0.8.0 added a conservative compression layer for large datasets.  The goal is not to throw rows away blindly; the sampler builds **weighted prototypes** and stores the map from every original row back to its prototype.
+
+```python
+from forest_clustering import PrototypeSampler, SubsampledClusterer, AutoTreeClusterer
+
+sampler = PrototypeSampler(
+    method="leaf_signature",
+    compression=0.20,          # keep roughly up to 20% prototypes
+    n_partitions=128,
+    n_bins="auto",
+    preserve_rare=True,        # protect tiny buckets / rare groups
+    rare_bucket_min_size=3,
+    random_state=42,
+)
+
+X_proto, weights = sampler.fit_resample(X)
+print(sampler.compression_summary())
+
+clusterer = AutoTreeClusterer(k_range=range(2, 8), random_state=42)
+model = SubsampledClusterer(sampler=sampler, clusterer=clusterer)
+labels = model.fit_predict(X)          # labels for all original rows
+labels_new = model.predict(X_new)      # assigned through nearest prototype
+```
+
+Two sampler modes are provided:
+
+| Method | Idea | Use when |
+|---|---|---|
+| `leaf_signature` | Use the library's random partition signatures, group rows with the same coarse signature, keep representative rows plus weights. | Mixed-type tabular data, many duplicates or near-duplicates, tree-clustering workflows. |
+| `birch` | Use sklearn BIRCH on a numeric encoded feature space and keep medoid prototypes for subclusters. | Dense numeric data or already well-encoded features. |
+
+The sampler exposes diagnostics and plots:
+
+```python
+sampler.plot_compression()
+sampler.plot_prototype_weights()
+sampler.plot_reconstruction_error()
+```
+
+Important: prototype sampling can speed up expensive clustering, especially when pairwise proximity matrices would otherwise be large.  It can also damage rare microclusters if configured aggressively. Keep `preserve_rare=True` unless you are deliberately compressing noise.
+
+
+## Diagnostics and visualisation
+
+Version 0.9.0 adds a diagnostic workflow for checking whether a clustering result is usable.
+
+```python
+from forest_clustering import AutoTreeClusterer, ClusterDiagnosticsReport
+
+model = AutoTreeClusterer(k_range=range(2, 8), random_state=42).fit(X)
+report = ClusterDiagnosticsReport(model, X)
+
+print(report.summary())
+print(report.health_checks())
+print("\n\n".join(report.cluster_cards()))
+
+report.plot_overview()
+report.plot_proximity_heatmap()
+report.plot_cluster_profiles()
+```
+
+For stochastic algorithms, inspect stability:
+
+```python
+from forest_clustering import StabilityAnalyzer
+
+stability = StabilityAnalyzer(model, n_runs=10, random_state=42).fit(X)
+print(stability.summary())
+stability.plot_score_distribution()
+```
+
+For model comparison:
+
+```python
+from forest_clustering import compare_clusterings, ForestClusterer, UnsupervisedRandomForestClusterer
+from sklearn.cluster import KMeans
+
+comparison = compare_clusterings(X, {
+    "forest": ForestClusterer(n_clusters=3, random_state=42),
+    "urf": UnsupervisedRandomForestClusterer(n_clusters=3, random_state=42),
+    "kmeans": KMeans(n_clusters=3, n_init=10, random_state=42),
+})
+
+print(comparison.rank())
+comparison.plot_scores()
+comparison.plot_pairwise_agreement()
+```
+
+The diagnostics are practical warning signals, not mathematical proof that a segmentation is uniquely correct. Treat health checks, stability and cluster cards as a review process before using clusters in production.
+
+`compare_clusterings()` automatically retries ordinary sklearn estimators on a robust encoded feature matrix when they cannot consume mixed string/categorical columns. This makes baseline comparisons convenient without changing the native preprocessing of forest-clustering estimators.

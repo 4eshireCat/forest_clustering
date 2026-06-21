@@ -1,0 +1,10 @@
+include README.md
+include ALGORITHM.md
+include CHANGELOG.md
+include RELEASE.md
+include LICENSE
+include pyproject.toml
+recursive-include tests *.py
+prune notebooks
+prune reports
+recursive-exclude * __pycache__ *.py[cod]

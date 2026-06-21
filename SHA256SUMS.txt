@@ -1,0 +1,2 @@
+0b7957bd98ca6d1a83e6183d26f06f50a45fa19763e6e466d88d997547224308  dist/forest_clustering-0.8.0-py3-none-any.whl
+a6c39db358372aa2c637d823fc0ea8d69e9565dab4d8b3197421b07a00a81da0  dist/forest_clustering-0.8.0.tar.gz
