@@ -127,6 +127,7 @@ class ForestTransformer(BaseEstimator, TransformerMixin):
                 threshold=self.corr_threshold,
                 sample_size=self.corr_sample_size,
                 rng=rng,
+                feature_types=self.encoder_.feature_types_,
             )
         else:
             self.feature_weights_ = np.ones(d)

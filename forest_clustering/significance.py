@@ -213,19 +213,18 @@ def permutation_test_ari(
         y_perm = rng.permutation(y_true)
         null_dist[b] = _safe_ari(y_perm, y_pred)
 
-    # P-value with +1 correction (Phipson & Smyth, 2010)
-    # Special case: ARI = 1.0 → minimum p-value (§9.1.5)
-    if ari_obs >= 1.0 - 1e-12:
-        p_value = 1.0 / (n_permutations + 1)
-    else:
-        if alternative == "greater":
-            count = np.sum(null_dist >= ari_obs)
-        elif alternative == "less":
-            count = np.sum(null_dist <= ari_obs)
-        else:  # two-sided
-            obs_abs = abs(ari_obs)
-            count = np.sum(np.abs(null_dist) >= obs_abs)
-        p_value = (1 + count) / (n_permutations + 1)
+    # P-value with +1 correction (Phipson & Smyth, 2010).  Null ties must
+    # always be counted, including at ARI=1: a statistic that is invariant
+    # under permutation (for example, two single-cluster labelings) carries no
+    # evidence against independence.
+    if alternative == "greater":
+        count = np.sum(null_dist >= ari_obs)
+    elif alternative == "less":
+        count = np.sum(null_dist <= ari_obs)
+    else:  # two-sided
+        obs_abs = abs(ari_obs)
+        count = np.sum(np.abs(null_dist) >= obs_abs)
+    p_value = (1 + count) / (n_permutations + 1)
 
     ci_lower, ci_upper = float(np.percentile(null_dist, 2.5)), float(
         np.percentile(null_dist, 97.5)
@@ -632,12 +631,16 @@ def cluster_significance(
     # Apply multiple testing correction if requested
     if correction_method is not None and p_values:
         correction_result = apply_multiple_testing_correction(
-            np.array(p_values), method=correction_method,
+            np.array(p_values), method=correction_method, alpha=alpha,
         )
         corrected_pvals = correction_result["p_values_adjusted"]
-        for i, cluster in enumerate(clusters):
-            if cluster["p_value"] is not None:
-                cluster["p_value_corrected"] = float(corrected_pvals[i])
+        rejected = correction_result["rejected"]
+        testable_clusters = [c for c in clusters if c["p_value"] is not None]
+        for cluster, corrected_p, is_rejected in zip(
+            testable_clusters, corrected_pvals, rejected
+        ):
+            cluster["p_value_corrected"] = float(corrected_p)
+            cluster["is_significant"] = bool(is_rejected)
 
     n_significant = sum(1 for c in clusters if c["is_significant"])
     significant_clusters = [c["cluster_id"] for c in clusters if c["is_significant"]]

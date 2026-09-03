@@ -163,3 +163,18 @@ def test_auto_tree_validates_scoring_space_and_sample_size():
         AutoTreeClusterer(algorithms=("forest",), k_range=(2,), scoring_space="bad").fit(X)
     with pytest.raises(ValueError, match="scoring_sample_size"):
         AutoTreeClusterer(algorithms=("forest",), k_range=(2,), scoring_sample_size=1).fit(X)
+
+
+def test_stability_does_not_reward_a_degenerate_single_cluster_solution():
+    X = pd.DataFrame(np.ones((20, 2)), columns=["x", "y"])
+    model = AutoTreeClusterer(
+        algorithms=("binary_tree",),
+        k_range=(2, 3),
+        scoring="stability",
+        n_restarts=2,
+        estimator_params={"binary_tree": {"n_thresholds": 8}},
+        random_state=0,
+    )
+
+    with pytest.raises(RuntimeError, match="valid clustering"):
+        model.fit(X)

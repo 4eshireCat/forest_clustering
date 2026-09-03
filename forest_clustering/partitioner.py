@@ -48,7 +48,22 @@ def build_col_stats(
             n_unique = len(np.unique(finite)) if len(finite) else 0
             q25 = float(np.percentile(finite, 25)) if len(finite) else 0.0
             q75 = float(np.percentile(finite, 75)) if len(finite) else 0.0
+            mean = float(np.mean(finite)) if len(finite) else 0.0
             std = float(np.std(finite)) if len(finite) else 0.0
+            count = int(len(finite))
+            m2 = float(np.sum((finite - mean) ** 2)) if len(finite) else 0.0
+            numerical_stats = {
+                "type": "numerical",
+                "min": lo,
+                "max": hi,
+                "n_unique": n_unique,
+                "q25": q25,
+                "q75": q75,
+                "mean": mean,
+                "std": std,
+                "count": count,
+                "m2": m2,
+            }
             if (quantile_cuts or cut_strategy == "quantile") and len(finite) > 1:
                 # Store a sorted empirical sample and draw random probabilities at
                 # spec-construction time.  The previous implementation sampled raw
@@ -61,9 +76,9 @@ def build_col_stats(
                 else:
                     q_sample = finite
                 qpts = np.sort(np.asarray(q_sample, dtype=np.float64))
-                stats.append({"type": "numerical", "quantile_pts": qpts, "min": lo, "max": hi, "n_unique": n_unique, "q25": q25, "q75": q75, "std": std})
+                stats.append({**numerical_stats, "quantile_pts": qpts})
             else:
-                stats.append({"type": "numerical", "min": lo, "max": hi, "n_unique": n_unique, "q25": q25, "q75": q75, "std": std})
+                stats.append(numerical_stats)
         else:
             # categoricals are label-encoded ints in [0, n_unique-1]; -1 = unknown
             valid = col[col >= 0].astype(np.int32)

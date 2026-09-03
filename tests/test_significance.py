@@ -221,28 +221,28 @@ class TestPermutationTestARI:
         result = permutation_test_ari(y_true, y_pred, n_permutations=100)
         assert result["ari_observed"] == pytest.approx(1.0, abs=1e-9)
 
-    def test_perfect_agreement_p_value_at_minimum(self, perfect_labels):
-        """Perfect agreement -> p_value = 1/(B+1) if no null ties, else larger.
-
-        With the +1 correction, the minimum possible p_value is 1/(B+1).
-        If any null value equals the observed ARI (=1.0), count increases.
-        We check that p_value achieves the theoretical minimum (or close).
-        """
+    def test_perfect_agreement_p_value_counts_null_ties(self, perfect_labels):
+        """Permutation p-values must count null statistics tied with ARI=1."""
         y_true, y_pred = perfect_labels
         B = 100
-        result = permutation_test_ari(y_true, y_pred, n_permutations=B)
-        min_p = 1.0 / (B + 1)
-        # p_value should be close to the minimum for perfect agreement
-        assert result["p_value"] >= min_p
-        # For perfect agreement with ARI=1, null values rarely reach 1.0
-        # so p_value should typically equal the minimum
-        assert result["p_value"] <= min_p * 3  # allow some ties
+        result = permutation_test_ari(
+            y_true, y_pred, n_permutations=B, random_state=42
+        )
+        expected = (
+            1 + np.sum(result["null_distribution"] >= result["ari_observed"])
+        ) / (B + 1)
+        assert result["p_value"] == pytest.approx(expected)
 
-    def test_perfect_agreement_is_significant(self, perfect_labels):
-        """Perfect agreement must always be significant."""
+    def test_perfect_agreement_can_be_non_significant_with_many_null_ties(
+        self, perfect_labels
+    ):
+        """Effect size 1 does not imply significance in a small discrete null."""
         y_true, y_pred = perfect_labels
-        result = permutation_test_ari(y_true, y_pred, n_permutations=100)
-        assert result["is_significant"] is True
+        result = permutation_test_ari(
+            y_true, y_pred, n_permutations=100, random_state=42
+        )
+        assert result["p_value"] > 0.05
+        assert result["is_significant"] is False
 
     def test_perfect_agreement_effect_size_large(self, perfect_labels):
         """ARI = 1.0 -> effect_size must be 'large'."""
@@ -299,6 +299,16 @@ class TestPermutationTestARI:
         y_true, y_pred = single_cluster_labels
         result = permutation_test_ari(y_true, y_pred, n_permutations=100)
         assert result["ari_observed"] == pytest.approx(1.0, abs=1e-9)
+
+    def test_single_cluster_null_is_not_significant(self, single_cluster_labels):
+        """A labeling invariant under permutation contains no evidence of association."""
+        y_true, y_pred = single_cluster_labels
+        result = permutation_test_ari(
+            y_true, y_pred, n_permutations=100, random_state=42
+        )
+        np.testing.assert_array_equal(result["null_distribution"], 1.0)
+        assert result["p_value"] == 1.0
+        assert result["is_significant"] is False
 
     def test_one_single_one_multi_ari_is_zero(self, one_vs_many_labels):
         """One single-cluster, one multi-cluster -> ARI = 0.0.
@@ -1020,19 +1030,23 @@ class TestClusterSignificance:
     # -- Small cluster (n_k < 3) edge case ----------------------------------
 
     def test_small_cluster_skipped(self):
-        """Clusters with size < 3 should have is_significant = False."""
+        """Correction must skip untestable clusters without shifting p-values."""
         X = np.array([
             [0, 0], [0, 0.1],          # cluster 0, size 2 (< 3)
             [10, 10], [10, 10.1],      # cluster 1, size 2 (< 3)
             [20, 20], [20, 0.1], [20, 0.2],  # cluster 2, size 3 (>= 3)
         ], dtype=float)
         labels = np.array([0, 0, 1, 1, 2, 2, 2])
-        # Use correction_method=None to avoid implementation bug
-        # when some clusters are skipped (n_k < 3) and correction is applied
-        result = cluster_significance(X, labels, n_bootstrap=50, correction_method=None)
+        result = cluster_significance(
+            X, labels, n_bootstrap=50, correction_method="bonferroni"
+        )
         for cluster in result["clusters"]:
             if cluster["size"] < 3:
                 assert cluster["is_significant"] is False
+                assert cluster["p_value"] is None
+                assert "p_value_corrected" not in cluster
+            else:
+                assert "p_value_corrected" in cluster
 
     # -- Determinism --------------------------------------------------------
 
@@ -1104,6 +1118,9 @@ class TestClusterSignificance:
                 assert "p_value_corrected" in cluster
                 assert cluster["p_value_corrected"] >= cluster["p_value"]
                 assert cluster["p_value_corrected"] <= 1.0
+                assert cluster["is_significant"] == (
+                    cluster["p_value_corrected"] <= 0.05
+                )
 
     def test_correction_method_none(self, well_separated_embedding):
         """correction_method=None should skip correction."""
@@ -1323,4 +1340,3 @@ class TestInvariants:
         assert r10["p_value"] >= 1.0 / 11
         assert r100["p_value"] >= 1.0 / 101
         assert r500["p_value"] >= 1.0 / 501
-

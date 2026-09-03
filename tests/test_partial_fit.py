@@ -139,6 +139,45 @@ class TestDriftDetection:
         # specs should be the same object
         assert fc.specs_ is specs_before
 
+    def test_identical_skewed_batch_does_not_trigger_false_drift(self):
+        from forest_clustering import ForestClusterer
+
+        X = np.array([[0.0], [0.0], [0.0], [0.0], [100.0]])
+        fc = ForestClusterer(
+            n_iterations=5,
+            n_clusters=2,
+            feature_types={0: "numerical"},
+            partial_fit_strategy="drift",
+            random_state=42,
+        ).fit(X)
+
+        fc.partial_fit(X)
+
+        assert fc._n_rebuilds_ == 0
+
+    def test_running_statistics_match_all_seen_numerical_rows(self):
+        from forest_clustering import ForestClusterer
+
+        first = np.array([[0.0], [0.0], [100.0]])
+        second = np.array([[20.0], [40.0]])
+        combined = np.vstack([first, second]).ravel()
+        fc = ForestClusterer(
+            n_iterations=5,
+            n_clusters=2,
+            feature_types={0: "numerical"},
+            partial_fit_strategy="never",
+            random_state=42,
+        ).fit(first)
+
+        fc.partial_fit(second)
+        stats = fc._col_stats_accum_[0]
+
+        assert stats["count"] == len(combined)
+        assert stats["mean"] == pytest.approx(np.mean(combined))
+        assert stats["std"] == pytest.approx(np.std(combined))
+        assert stats["min"] == np.min(combined)
+        assert stats["max"] == np.max(combined)
+
 
 class TestPartialFitBackwardCompat:
     """Backward compatibility."""

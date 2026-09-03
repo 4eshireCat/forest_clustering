@@ -150,11 +150,11 @@ class TestHopkinsGridData:
 class TestHopkinsEdgeCases:
     """H-4 through H-6: Edge cases for Hopkins statistic."""
 
-    def test_all_identical_returns_one(self):
-        """All-identical samples represent perfect aggregation -> H = 1.0."""
+    def test_all_identical_is_neutral(self):
+        """Hopkins is non-informative when both nearest-neighbor sums are zero."""
         X = np.ones((50, 3))
         H = hopkins_statistic(X, n_samples=10, random_state=42)
-        assert H == 1.0, f"Expected H = 1.0 for identical samples, got H={H:.4f}"
+        assert H == 0.5, f"Expected H = 0.5 for identical samples, got H={H:.4f}"
 
     def test_constant_feature_handled(self, data_constant_feature):
         """Constant feature should not crash; H must remain in [0, 1]."""
@@ -171,7 +171,7 @@ class TestHopkinsEdgeCases:
         """All features constant -> bounding box has zero volume -> H = 0.5."""
         X = np.full((20, 3), 5.0)
         H = hopkins_statistic(X, n_samples=5, random_state=42)
-        assert H == 1.0, f"Expected H = 1.0 for all-constant identical data, got H={H:.4f}"
+        assert H == 0.5, f"Expected H = 0.5 for all-constant data, got H={H:.4f}"
 
     def test_two_samples(self):
         """Minimal valid dataset with n = 2."""
@@ -310,13 +310,13 @@ class TestGapClusteredData:
 class TestGapEdgeCases:
     """G-3 through G-4: Edge cases for Gap statistic."""
 
-    def test_all_identical_returns_inf(self):
-        """All-identical samples -> W_1_data = 0 -> log = -inf -> Gap(1) = +inf."""
+    def test_all_identical_is_non_clusterable(self):
+        """A collapsed bounding box provides no null evidence for clustering."""
         X = np.ones((50, 3))
         result = gap_statistic(X, k_max=1, n_refs=5, random_state=42)
-        assert result["gap_1"] == float("inf"), (
-            f"Expected Gap(1) = +inf for identical samples, got {result['gap_1']}"
-        )
+        assert result["gap_1"] == 0.0
+        assert result["best_k"] == 1
+        assert result["is_clusterable"] is False
 
     def test_b_equal_one_produces_nan_s1(self):
         """B = 1 -> cannot compute sample standard deviation -> s_1 = NaN."""
@@ -551,24 +551,24 @@ class TestClusterabilityMethodSwitching:
 
 
 class TestClusterabilityAllIdentical:
-    """All-identical data -> both tests indicate clusterable."""
+    """All-identical data has no evidence for more than one cluster."""
 
-    def test_identical_hopkins_is_one(self):
+    def test_identical_hopkins_is_neutral(self):
         X = np.ones((30, 3))
         result = clusterability_test(X, method="both", random_state=42)
-        assert result["hopkins"] == 1.0
-        assert result["hopkins_is_clusterable"] is True
+        assert result["hopkins"] == 0.5
+        assert result["hopkins_is_clusterable"] is False
 
-    def test_identical_gap_is_inf(self):
+    def test_identical_gap_is_neutral(self):
         X = np.ones((30, 3))
         result = clusterability_test(X, method="both", random_state=42)
-        assert result["gap_1"] == float("inf")
-        assert result["gap_is_clusterable"] is True
+        assert result["gap_1"] == 0.0
+        assert result["gap_is_clusterable"] is False
 
     def test_identical_combined_decision(self):
         X = np.ones((30, 3))
         result = clusterability_test(X, method="both", random_state=42)
-        assert result["is_clusterable"] is True
+        assert result["is_clusterable"] is False
 
 
 class TestClusterabilityDeterminism:

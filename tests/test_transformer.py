@@ -334,6 +334,22 @@ class TestReproducibility:
         assert not np.array_equal(E1, E2)
 
 
+def test_categorical_renaming_does_not_change_correlation_weights():
+    """Nominal category codes must never be interpreted as ordered ranks."""
+    from forest_clustering.transformer import ForestTransformer
+
+    values = ["a", "b", "c"] * 10
+    original = pd.DataFrame({"left": values, "right": values})
+    renamed = original.copy()
+    renamed["right"] = renamed["right"].map({"a": "z", "b": "x", "c": "y"})
+
+    first = ForestTransformer(n_iterations=4, random_state=0).fit(original)
+    second = ForestTransformer(n_iterations=4, random_state=0).fit(renamed)
+
+    np.testing.assert_array_equal(first.feature_weights_, np.ones(2))
+    np.testing.assert_array_equal(second.feature_weights_, np.ones(2))
+
+
 class TestParameterMirroring:
     """ForestTransformer parameters must mirror ForestClusterer parameters."""
 

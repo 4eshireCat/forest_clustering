@@ -115,6 +115,24 @@ def test_invalid_sampler_parameters_raise_clear_errors():
         PrototypeSampler(representative="bad").fit([[1], [2]])
 
 
+def test_leaf_signature_medoid_uses_hamming_geometry():
+    """Integer leaf ids are nominal, so their magnitudes must not affect a medoid."""
+    signatures = np.array([
+        [300_000_000_000_000, 0, 0, 0, 0],
+        [300_000_000_000_000, 0, 0, 0, 0],
+        [0, 1, 1, 1, 1],
+        [0, 1, 1, 1, 1],
+        [1_000_000_000_000_000, 1, 1, 1, 1],
+    ], dtype=np.int64)
+    sampler = PrototypeSampler(method="leaf_signature", representative="medoid")
+
+    representative = sampler._representative_index(
+        np.arange(len(signatures)), signatures
+    )
+
+    assert representative == 2
+
+
 def test_subsampled_clusterer_classifier_assignment_predicts():
     X, _ = make_blobs(n_samples=90, centers=3, cluster_std=0.25, random_state=8)
     model = SubsampledClusterer(

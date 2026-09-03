@@ -201,6 +201,8 @@ class AutoTreeClusterer(BaseEstimator, ClusterMixin):
         self.cv_results_ = self._aggregate_results(self.search_results_, scoring)
         if self.cv_results_.empty:
             raise RuntimeError("No AutoTreeClusterer candidates were evaluated")
+        if not np.isfinite(self.cv_results_["mean_score"]).any():
+            raise RuntimeError("No candidate produced a valid clustering")
 
         best_row = self.cv_results_.iloc[0]
         best_group_id = int(best_row["group_id"])
@@ -502,6 +504,8 @@ class AutoTreeClusterer(BaseEstimator, ClusterMixin):
 
     @staticmethod
     def _stability(labelings) -> float:
+        if any(not AutoTreeClusterer._valid_labeling(labels) for labels in labelings):
+            return -np.inf
         if len(labelings) < 2:
             return 0.0
         scores = [adjusted_rand_score(a, b) for a, b in combinations(labelings, 2)]

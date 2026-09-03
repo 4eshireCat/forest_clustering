@@ -4,13 +4,40 @@ Tree-based and random-partition clustering for mixed-type tabular data.
 
 `forest-clustering` provides sklearn-style estimators that convert tabular rows into tree or partition embeddings, compute sample-to-sample similarities, and then run a downstream clustering algorithm. It is designed for practical unsupervised learning on mixed numerical/categorical data where Euclidean distance is often a poor default.
 
+## What to expect — and what not to expect
+
+This package is a clustering toolkit and representation family, not a universally superior clustering algorithm. Its main practical advantage is the ability to consume mixed numerical and categorical tables without requiring users to design an encoding and scaling pipeline first. That convenience does not guarantee better clusters than a well-preprocessed sklearn baseline.
+
+The repository examples currently support the following, more limited conclusions:
+
+- `ForestClusterer` with a fixed cluster count and its default KMeans downstream step can be a strong mixed-type baseline. On synthetic data generated from well-separated Gaussian centres it performs well, but a properly scaled KMeans or Ward clustering can perform better because those methods match the data-generating geometry directly.
+- Quantile-based cuts can reduce sensitivity to extreme values, but robustness is dataset-, seed-, contamination-level-, and downstream-clusterer-dependent. Refitting after adding outliers changes the sampled partitions and may change the final clusters. Treat robustness as something to measure on the same uncontaminated rows across repeated runs, not as a guaranteed property.
+- Louvain and Leiden discover communities in a k-nearest-neighbour graph; they do **not** infer a uniquely correct number of clusters and they do not accept a target cluster count. Sparse or disconnected graphs can produce dozens or hundreds of communities. `n_neighbors` and `resolution` require validation, and lowering `resolution` cannot merge disconnected graph components.
+- Random-forest and ExtraTrees proximity estimators provide useful alternative representations, but they do not consistently outperform KMeans, Ward, or the random-partition estimator on internal metrics. The interpretable binary tree is useful when explicit rules matter, not because it is guaranteed to maximise clustering quality.
+- `AutoTreeClusterer` selects the best candidate in the supplied search space according to an internal proxy. It cannot establish that the selected partition is meaningful, unique, or useful for a downstream decision.
+
+Current notebook results illustrate these trade-offs: the centroid path is generally competitive on the mixed-type examples, while the graph and some tree-proximity paths can be materially worse than simple baselines. They should be treated as candidate models to evaluate, not automatic upgrades.
+
+### Minimum evaluation checklist
+
+Before describing a result as good or using it in production:
+
+1. Compare against at least KMeans on an imputed/scaled/one-hot representation; add Ward or another appropriate baseline when dataset size permits.
+2. Compare like with like: use the same rows, the same target number of clusters when the algorithms support it, and the same noise-handling rule.
+3. Evaluate multiple random seeds and report variability. A single favourable seed is not evidence of stability.
+4. Report cluster sizes, noise share, stability under resampling or contamination, and at least one internal metric in a clearly stated feature space or distance metric.
+5. Inspect cluster profiles for practical interpretability. Silhouette, Calinski-Harabasz, Davies-Bouldin, Gap, and Hopkins are diagnostics rather than proof of a true segmentation.
+6. If an external label is used for ARI or NMI, do not include that label among the clustering features. Classification labels are often only a partial clustering reference.
+
+For graph clustering, also inspect graph connectivity. The number of non-singleton connected components is a hard lower bound on the number of non-noise communities unless a separate cross-component merge step is introduced.
+
 ## What is included
 
 | Estimator | Core idea | Best use case |
 |---|---|---|
-| `ForestClusterer` | Random feature partitions produce an integer embedding; Hamming similarity measures co-partitioning. | Fast mixed-type clustering, large tabular data, robust random-partition baseline. |
-| `UnsupervisedRandomForestClusterer` | Breiman-style unsupervised random forest: real rows vs synthetic null rows, then same-leaf proximity. | Canonical random-forest proximity clustering. |
-| `ExtraTreesProximityClusterer` | ExtraTrees version of the synthetic-null forest; more randomized splits and fast leaf proximity. | Faster tree-proximity baseline with strong randomization. |
+| `ForestClusterer` | Random feature partitions produce an integer embedding; Hamming similarity measures co-partitioning. | Fast mixed-type candidate and random-partition baseline; benchmark it against standard preprocessing. |
+| `UnsupervisedRandomForestClusterer` | Breiman-style unsupervised random forest: real rows vs synthetic null rows, then same-leaf proximity. | Random-forest proximity candidate when interactions or a non-Euclidean representation are plausible. |
+| `ExtraTreesProximityClusterer` | ExtraTrees version of the synthetic-null forest; more randomized splits and fast leaf proximity. | Highly randomized tree-proximity candidate; validate quality against simpler baselines. |
 | `UnsupervisedBinaryTreeClusterer` | Greedy interpretable binary tree that recursively splits rows to reduce within-leaf variance. | Explainable cluster rules and small/medium tabular datasets. |
 | `AutoTreeClusterer` | Tries several tree-based estimators, cluster counts, parameter grids and random restarts; selects the best by internal score/stability. | Practical autoparameter selection when you do not know the best algorithm or `k`. |
 | `ForestTransformer` | Transformer-only wrapper around `ForestClusterer`. | sklearn pipelines and custom downstream models. |
@@ -225,13 +252,13 @@ labels = pipe.fit_predict(X)
 | Goal | Recommendation |
 |---|---|
 | Fast baseline | `ForestClusterer(n_iterations=100, n_bins=3)` |
-| Robust mixed-type clustering | `ForestClusterer(cut_strategy="quantile", corr_threshold=0.8)` |
+| Mixed-type candidate with possible extreme values | Start with `ForestClusterer(cut_strategy="quantile", corr_threshold=0.8)`, then test stability against a non-quantile configuration and standard baselines. |
 | Canonical tree proximity | `UnsupervisedRandomForestClusterer(n_estimators=300)` |
 | Faster randomized tree proximity | `ExtraTreesProximityClusterer(n_estimators=300)` |
 | Explainable clusters | `UnsupervisedBinaryTreeClusterer(n_clusters=k)` |
-| Unknown algorithm / cluster count | `AutoTreeClusterer(k_range=range(2, 8), scoring="combined")` |
-| Unknown number of clusters but fixed algorithm | Pair proximity/distance with `DBSCAN`, HDBSCAN, or graph clustering. |
-| Large data | Use `MiniBatchKMeans` on embeddings or graph/LSH helpers. |
+| Unknown algorithm / cluster count | Use `AutoTreeClusterer(k_range=range(2, 8), scoring="combined")` for candidate selection, then review stability, profiles, and baseline comparisons. |
+| Unknown number of clusters but fixed algorithm | Pair proximity/distance with DBSCAN, HDBSCAN, or graph clustering; expect sensitivity to density, connectivity, and resolution parameters. |
+| Large data | Prefer MiniBatchKMeans on embeddings; graph/LSH helpers are optional candidates whose connectivity and community count must be checked. |
 
 ## API summary
 

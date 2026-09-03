@@ -89,9 +89,10 @@ def hopkins_statistic(
         )
         m = n  # use all samples
 
-    # All-identical samples → perfect aggregation ---------------------------
+    # The Hopkins ratio is 0/0 for all-identical data.  Return the neutral
+    # value instead of claiming maximal clustering evidence.
     if np.allclose(X, X[0], atol=1e-12):
-        return 1.0
+        return 0.5
 
     # Bounding box (handles constant features gracefully) -------------------
     bbox_min = X.min(axis=0)
@@ -149,7 +150,7 @@ def gap_statistic(
         - 'gap_k'     : list of Gap(k) values, k = 1 … k_max_eff
         - 'w_k'       : list of W_k (pooled within-cluster dispersion)
         - 'best_k'    : int, estimated optimal k (or 1)
-        - 'is_clusterable' : bool, Gap(1) >= 0.10 → True
+        - 'is_clusterable' : bool, selected best_k > 1
         - 'gap_1'     : float, Gap(1) value
         - 's_1'       : float, standard error for Gap(1)
         - 's_k'       : list of float, standard errors for each k
@@ -180,6 +181,23 @@ def gap_statistic(
         # correlation with an external rng that shares the same seed).
         seed = random_state + 2 if isinstance(random_state, int) else random_state
         rng = np.random.RandomState(seed)
+
+    # A collapsed bounding box makes both observed and reference dispersions
+    # zero, so Gap is undefined (-inf - -inf).  Return the neutral convention
+    # before running meaningless KMeans fits for k > 1.
+    if np.allclose(X, X[0], atol=1e-12):
+        return {
+            "gap_k": [0.0],
+            "w_k": [0.0],
+            "best_k": 1,
+            "is_clusterable": False,
+            "gap_1": 0.0,
+            "s_1": 0.0,
+            "s_k": [0.0],
+            "log_W_1_data": float("-inf"),
+            "E_log_W_ref": float("-inf"),
+            "log_W_refs": [float("-inf")] * B,
+        }
 
     # Warn about unreliable standard error when B == 1 --------------------
     if B == 1:
@@ -217,28 +235,6 @@ def gap_statistic(
             W_k = float(km.inertia_ / n)  # inertia = sum of squared distances
         w_k_data.append(W_k)
         kmeans_labels.append(labels)
-
-    # MAJOR #M2: Handle all-identical data: W_1 == 0 → Gap(1) = +inf.
-    # All points coinciding → by definition one cluster → clusterable.
-    all_identical = w_k_data[0] < 1e-15
-    if all_identical:
-        gap_1 = float("inf")
-        s_1 = float("nan")
-        log_W_1_data = float("-inf")
-        E_log_W_ref = float("nan")
-        is_clusterable = True
-        return {
-            "gap_k": [float("inf")],
-            "w_k": [float(w_k_data[0])],
-            "best_k": 1,
-            "is_clusterable": True,
-            "gap_1": float("inf"),
-            "s_1": float("nan"),
-            "s_k": [float("nan")],
-            "log_W_1_data": float("-inf"),
-            "E_log_W_ref": float("nan"),
-            "log_W_refs": [],
-        }
 
     # ---- Generate reference datasets and compute W_k for each ------------
     log_W_refs_per_k = [[] for _ in range(k_max_eff)]  # log_W_refs_per_k[k-1]

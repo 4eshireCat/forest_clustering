@@ -308,7 +308,7 @@ class PrototypeSampler(BaseEstimator, TransformerMixin):
         self.signature_depth_ = depth
         E_key = E[:, :depth]
         self.prototype_signatures_ = None  # filled after groups are built
-        self._build_groups_from_keys(X_df, E_key, feature_matrix=E.astype(float))
+        self._build_groups_from_keys(X_df, E_key, feature_matrix=E)
         self.prototype_signatures_ = E[self.prototype_indices_, :]
         self.reconstruction_distances_ = self._signature_reconstruction_distances(E)
         self._finalize_report(reconstruction_distances=self.reconstruction_distances_)
@@ -408,6 +408,19 @@ class PrototypeSampler(BaseEstimator, TransformerMixin):
     def _representative_index(self, idx_arr: np.ndarray, feature_matrix=None) -> int:
         if len(idx_arr) == 1 or self.representative == "first" or feature_matrix is None:
             return int(idx_arr[0])
+        if self.method == "leaf_signature":
+            # Leaf ids are nominal.  The exact Hamming medoid minimizes the
+            # total number of mismatched partition coordinates.  Compute that
+            # objective from per-column category counts without materializing
+            # an O(n^2) distance matrix.
+            signatures = np.asarray(feature_matrix[idx_arr])
+            mismatch_counts = np.zeros(len(idx_arr), dtype=np.int64)
+            for column in signatures.T:
+                _, inverse, counts = np.unique(
+                    column, return_inverse=True, return_counts=True
+                )
+                mismatch_counts += len(idx_arr) - counts[inverse]
+            return int(idx_arr[int(np.argmin(mismatch_counts))])
         if self.representative == "centroid" and self.method == "birch":
             # Return nearest row to centroid so that X_resampled keeps the same
             # schema as X.  True encoded centroids are exposed only internally.

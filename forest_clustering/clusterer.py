@@ -576,11 +576,37 @@ class ForestClusterer(BaseEstimator, ClusterMixin):
             col_finite = col[np.isfinite(col)]
             if len(col_finite) == 0:
                 continue
+            batch_count = int(len(col_finite))
+            batch_mean = float(np.mean(col_finite))
+            batch_m2 = float(np.sum((col_finite - batch_mean) ** 2))
+            previous = self._col_stats_accum_.get(j)
+            if not previous or int(previous.get('count', 0)) == 0:
+                total_count = batch_count
+                combined_mean = batch_mean
+                combined_m2 = batch_m2
+                combined_min = float(np.min(col_finite))
+                combined_max = float(np.max(col_finite))
+            else:
+                old_count = int(previous['count'])
+                old_mean = float(previous['mean'])
+                old_m2 = float(previous.get('m2', previous['std'] ** 2 * old_count))
+                total_count = old_count + batch_count
+                delta = batch_mean - old_mean
+                combined_mean = old_mean + delta * batch_count / total_count
+                combined_m2 = (
+                    old_m2
+                    + batch_m2
+                    + delta ** 2 * old_count * batch_count / total_count
+                )
+                combined_min = min(float(previous['min']), float(np.min(col_finite)))
+                combined_max = max(float(previous['max']), float(np.max(col_finite)))
             self._col_stats_accum_[j] = {
-                'mean': np.mean(col_finite),
-                'std': np.std(col_finite),
-                'min': np.min(col_finite),
-                'max': np.max(col_finite),
+                'count': total_count,
+                'mean': combined_mean,
+                'm2': combined_m2,
+                'std': float(np.sqrt(combined_m2 / total_count)),
+                'min': combined_min,
+                'max': combined_max,
             }
 
     def _update_accumulated_stats_from_col_stats(self):
@@ -589,11 +615,15 @@ class ForestClusterer(BaseEstimator, ClusterMixin):
             return
         for j, s in enumerate(self.col_stats_):
             if s['type'] == 'numerical':
+                count = int(s.get('count', 0))
+                std = float(s.get('std', max((s['max'] - s['min']) / 4, 1e-6)))
                 self._col_stats_accum_[j] = {
                     'mean': s.get('mean', (s['max'] + s['min']) / 2),
-                    'std': s.get('std', max((s['max'] - s['min']) / 4, 1e-6)),
+                    'std': std,
                     'min': s['min'],
                     'max': s['max'],
+                    'count': count,
+                    'm2': float(s.get('m2', std ** 2 * count)),
                 }
 
     def _rebuild_specs(self, X_enc=None):
